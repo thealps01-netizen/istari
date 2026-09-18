@@ -13,35 +13,40 @@ if errorlevel 1 (
     pause & exit /b 1
 )
 
-:: ── Install dependencies ─────────────────────────────────────────────────────
-echo  [1/4] Installing dependencies...
-pip install -r requirements-dev.txt --quiet --upgrade
+:: ── Build venv ────────────────────────────────────────────────────────────────
+:: Kept outside the repository: it is a machine-local cache of pinned
+:: dependencies, and the project folder may sit in a synced directory.
+set "VENV=%LOCALAPPDATA%\Istari\build-venv"
+if not exist "%VENV%\Scripts\python.exe" (
+    echo  [1/5] Creating build venv: %VENV%
+    python -m venv "%VENV%"
+    if errorlevel 1 ( echo  ERROR: could not create the build venv. & pause & exit /b 1 )
+)
+set "PY=%VENV%\Scripts\python.exe"
+
+:: ── Install dependencies (pinned) ─────────────────────────────────────────────
+echo  [1/5] Installing dependencies...
+"%PY%" -m pip install -r requirements-dev.txt --quiet
 if errorlevel 1 ( echo  ERROR: pip failed. & pause & exit /b 1 )
 
 :: ── Generate icon ─────────────────────────────────────────────────────────────
-echo  [2/4] Generating icon...
-python tools\make_icon.py
+echo  [2/5] Generating icon...
+"%PY%" tools\make_icon.py
 if errorlevel 1 ( echo  WARNING: Icon generation failed, building without icon. )
 
-:: ── Inject version into file_version_info.txt ────────────────────────────────
-for /f %%v in ('python -c "from version import __version__; print(__version__)"') do set APP_VER=%%v
-powershell -Command " ^
-  $v = '%APP_VER%'; ^
-  $vt = $v -replace '\.', ', '; ^
-  (Get-Content file_version_info.txt) ^
-    -replace 'filevers=\(.*?\)', \"filevers=($vt, 0)\" ^
-    -replace 'prodvers=\(.*?\)', \"prodvers=($vt, 0)\" ^
-    -replace \"'FileVersion',\s*'.*?'\", \"'FileVersion', '$v.0'\" ^
-    -replace \"'ProductVersion',\s*'.*?'\", \"'ProductVersion', '$v.0'\" ^
-  | Set-Content file_version_info.txt"
+:: ── Version metadata ─────────────────────────────────────────────────────────
+:: Single writer of the derived version files (see tools/version_sync.py).
+echo  [3/5] Syncing version metadata...
+"%PY%" tools\version_sync.py --inject
+if errorlevel 1 ( echo  ERROR: version sync failed. & pause & exit /b 1 )
 
 :: ── Build exe (onedir via Istari.spec) ─────────────────────────────────────
-echo  [3/4] Building Istari.exe...
-python -m PyInstaller Istari.spec --noconfirm
+echo  [4/5] Building Istari.exe...
+"%PY%" -m PyInstaller Istari.spec --noconfirm
 if errorlevel 1 ( echo  ERROR: PyInstaller build failed. & pause & exit /b 1 )
 
 :: ── Create installer with Inno Setup ─────────────────────────────────────────
-echo  [4/4] Creating installer...
+echo  [5/5] Creating installer...
 
 :: Try PATH first, then common install locations
 set ISCC=
@@ -57,7 +62,7 @@ if not defined ISCC (
 )
 
 if defined ISCC (
-    for /f %%v in ('python -c "from version import __version__; print(__version__)"') do set APP_VER=%%v
+    for /f %%v in ('"%PY%" -c "from version import __version__; print(__version__)"') do set APP_VER=%%v
     %ISCC% /DAppVersion=%APP_VER% istari.iss
     if errorlevel 1 ( echo  ERROR: Inno Setup failed. & pause & exit /b 1 )
     echo.

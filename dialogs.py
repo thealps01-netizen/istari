@@ -164,7 +164,7 @@ class WelcomeDialog(QDialog):
             inner.addLayout(row)
 
         inner.addWidget(_line(
-            "RAM and battery sensors work without Afterburner.",
+            "RAM and ping work without Afterburner.",
             small=True,
         ))
 
@@ -636,7 +636,10 @@ class SettingsDialog(QDialog):
         self.cfg["scale"]         = self.sld_sc.value()
         self.cfg["update_ms"]     = self.cmb.currentData()
         self.cfg["always_on_top"] = self.chk_top.isChecked()
-        set_startup(self.chk_startup.isChecked())
+        if not set_startup(self.chk_startup.isChecked()):
+            # Windows refused the change; show what is actually registered
+            # instead of leaving the box claiming a state that is not there.
+            self.chk_startup.setChecked(is_startup_enabled())
         self.cfg["theme"] = self.cmb_theme.currentData()
         self.cfg["layout"] = self.cmb_layout.currentData()
         self.cfg["anchor"] = self.cmb_pos.currentData()

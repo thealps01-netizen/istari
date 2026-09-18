@@ -20,6 +20,10 @@ logs/
 .idea/
 *.swp
 
+# Agent tooling (machine-local, never part of the project)
+.serena/
+.claude/
+
 # Windows
 Thumbs.db
 desktop.ini

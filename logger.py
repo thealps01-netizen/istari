@@ -6,17 +6,16 @@ and exposes a get_logger() helper used by every module.
 
 import logging
 import os
-import sys
 from logging.handlers import RotatingFileHandler
 
 # ── Log directory ──────────────────────────────────────────────────────────────
-if getattr(sys, "frozen", False):
-    _BASE = os.path.join(
-        os.environ.get("LOCALAPPDATA", os.path.dirname(sys.executable)),
-        "Istari",
-    )
-else:
-    _BASE = os.path.dirname(os.path.abspath(__file__))
+# Runtime data always lives in the application's own folder, frozen or not:
+# keeping development logs inside the repository mixes them with tracked files
+# and, on a synced working copy, pushes them into the cloud.
+_BASE = os.path.join(
+    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+    "Istari",
+)
 
 LOG_DIR  = os.path.join(_BASE, "logs")
 LOG_FILE = os.path.join(LOG_DIR, "istari.log")

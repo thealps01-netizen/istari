@@ -25,12 +25,12 @@ from dialogs import WelcomeDialog, SettingsDialog
 
 # ── GitHub repo — update these before each release ────────────────────────────
 _GITHUB_OWNER = "thealps01-netizen"
-_GITHUB_REPO  = "istari"                 # ← repo adı
+_GITHUB_REPO  = "istari"                 # ← repo name
 from cfg import (
     SENSOR_CATALOG, SETTINGS_FILE,
     load_cfg, save_cfg, eff_color, default_color,
     active_sensor_defs,
-    is_startup_enabled, set_startup,
+    is_startup_enabled, set_startup, purge_dead_legacy_startup,
 )
 
 
@@ -196,7 +196,7 @@ class Istari(QWidget):
         QApplication.instance().quit()
 
     def _play_outro(self):
-        """Kapanışta aşağıya kayarak + fade-out animasyonu."""
+        """Slide down and fade out on quit."""
         self._anim.stop()
         cfg_opacity = self.cfg["opacity"] / 100
         self.setWindowOpacity(cfg_opacity)
@@ -251,7 +251,7 @@ class Istari(QWidget):
         anim.start()
 
     def _play_intro(self):
-        """Açılışta yukarıdan kayarak + fade-in animasyonu."""
+        """Slide down from above and fade in on startup."""
         target = self.pos()
         start  = QPoint(target.x(), target.y() - 30)
         self.move(start)
@@ -324,11 +324,11 @@ class Istari(QWidget):
         self._apply_corner_mask()
 
     def _s(self, px: int) -> int:
-        """Pixel değerini mevcut scale faktörüyle ölçekler."""
+        """Scale a pixel value by the current scale factor."""
         return max(1, round(px * self.cfg.get("scale", 100) / 100))
 
     def _sp(self, pt: int) -> int:
-        """Font punto değerini mevcut scale faktörüyle ölçekler."""
+        """Scale a font point size by the current scale factor."""
         return max(6, round(pt * self.cfg.get("scale", 100) / 100))
 
     def _apply_window_flags(self):
@@ -385,8 +385,11 @@ class Istari(QWidget):
             hwnd = int(self.winId())
             cur  = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
             ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, cur | WS_EX_NOACTIVATE)
-        except Exception:
-            pass
+        except Exception as e:
+            # Losing this silently means the overlay starts stealing focus from
+            # the game — the one behaviour that must never regress unnoticed.
+            _log.warning("WS_EX_NOACTIVATE could not be applied (%s: %s) — "
+                         "the overlay may steal focus", type(e).__name__, e)
 
     # ── Hover animation ───────────────────────────────────────────────────────
     def enterEvent(self, e):
@@ -407,7 +410,7 @@ class Istari(QWidget):
 
     # ── Layout ────────────────────────────────────────────────────────────────
     def _clear_layout(self):
-        """Widget'taki mevcut layout ve tüm çocuk widget'ları temizler."""
+        """Tear down the current layout and all of its child widgets."""
         layout = self.layout()
         if layout is None:
             return
@@ -638,7 +641,7 @@ class Istari(QWidget):
                 desc.setStyleSheet(f"color:{c}; font:bold {self._sp(8)}pt 'Bahnschrift','Segoe UI';")
 
     def _apply_outer_layout(self):
-        """Outer margin ve spacing'leri mevcut scale ile günceller."""
+        """Update outer margins and spacings for the current scale."""
         if self.cfg.get("layout", "card") == "bar":
             self._root_layout.setContentsMargins(
                 self._s(10), self._s(5), self._s(6), self._s(5))
@@ -729,7 +732,7 @@ class Istari(QWidget):
         elif action == act_quit: self._quit()
 
     def closeEvent(self, e):
-        """Dışarıdan gelen close mesajlarını yoksay — sadece _quit() kapatabilir."""
+        """Ignore external close requests — only _quit() may close the overlay."""
         if getattr(self, '_quitting', False):
             e.accept()
         else:
@@ -799,7 +802,7 @@ class Istari(QWidget):
 
 # ── Splash screen ─────────────────────────────────────────────────────────────
 class SplashScreen(QWidget):
-    """Açılışta ekran ortasında dönen dolum animasyonu."""
+    """Startup spinner drawn in the middle of the screen."""
 
     def __init__(self):
         super().__init__()
@@ -865,14 +868,14 @@ class SplashScreen(QWidget):
         p.setBrush(QColor(8, 9, 22))
         p.drawEllipse(cx - r - 14, cy - r - 14, (r + 14) * 2, (r + 14) * 2)
 
-        # İz (track)
+        # Track
         track_pen = QPen(QColor(25, 27, 55), 5)
         track_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         p.setPen(track_pen)
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawEllipse(cx - r, cy - r, r * 2, r * 2)
 
-        # Dolum yayı
+        # Progress arc
         arc_pen = QPen(QColor(100, 116, 240), 5)
         arc_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         p.setPen(arc_pen)
@@ -934,7 +937,11 @@ if __name__ == "__main__":
 
     is_first_run = not os.path.exists(SETTINGS_FILE)
 
-    # ── Auto-refresh startup registry (fixes stale python.exe entries) ─────────
+    # ── Startup registry: keep our own entry fresh, drop the pre-rename one ───
+    # The old build registered "Palantir" pointing at a path the rename removed;
+    # nothing else ever cleans it up.
+    if purge_dead_legacy_startup():
+        _log.info("Legacy 'Palantir' startup entry removed.")
     if is_startup_enabled():
         set_startup(True)
         _log.info("Startup registry entry refreshed.")

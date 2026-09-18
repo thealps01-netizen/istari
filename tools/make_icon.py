@@ -215,7 +215,13 @@ def _round_existing(path):
 
 
 def main():
-    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "istari.ico")
+    # The icon the build actually consumes: Istari.spec (datas/icon) and
+    # istari.iss (SetupIconFile) both read the copy in the repository root, so
+    # this is where the generator has to write. Writing it under tools/ left the
+    # packaged icon untouched — the two copies drifted apart.
+    out = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "istari.ico"
+    )
     if os.path.exists(out):
         _round_existing(out)
         print(f"istari.ico  circular mask applied  ->  {out}")

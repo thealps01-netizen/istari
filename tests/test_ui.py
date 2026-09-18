@@ -74,3 +74,54 @@ def test_is_high_contrast_returns_bool(qapp_instance):
     from themes import is_high_contrast
     result = is_high_contrast()
     assert isinstance(result, bool)
+
+
+# ── Failures the user must be able to see ─────────────────────────────────────
+
+class _RecordingLog:
+    def __init__(self):
+        self.warnings = []
+
+    def warning(self, *args):
+        self.warnings.append(args)
+
+    def __getattr__(self, name):
+        return lambda *a, **k: None
+
+
+def test_startup_checkbox_reverts_when_the_registry_write_fails(qapp_instance, default_cfg, monkeypatch):
+    """Ticking "Launch at Windows startup" used to stick even when nothing was
+    registered, so the window claimed an autostart that did not exist."""
+    import dialogs
+
+    monkeypatch.setattr(dialogs, "save_cfg", lambda cfg: None)
+    monkeypatch.setattr(dialogs, "set_startup", lambda enabled: False)
+    monkeypatch.setattr(dialogs, "is_startup_enabled", lambda: False)
+
+    dlg = dialogs.SettingsDialog(default_cfg)
+    dlg.chk_startup.setChecked(True)
+
+    dlg._apply()
+
+    assert dlg.chk_startup.isChecked() is False
+    dlg.close()
+
+
+def test_no_activate_failure_is_reported_not_swallowed(qapp_instance, monkeypatch):
+    """WS_EX_NOACTIVATE silently failing removes the no-focus-steal guarantee."""
+    import istari
+
+    def deny(*_a):
+        raise OSError("access denied")
+
+    rec = _RecordingLog()
+    monkeypatch.setattr(istari, "_log", rec)
+    monkeypatch.setattr(istari.ctypes.windll.user32, "SetWindowLongW", deny)
+
+    class _FakeWidget:
+        def winId(self):
+            return 1234
+
+    istari.Istari._apply_no_activate(_FakeWidget())   # must not raise
+
+    assert any("WS_EX_NOACTIVATE" in str(w) for w in rec.warnings)

@@ -30,19 +30,27 @@ class _Hdr(ctypes.LittleEndianStructure):
 
 
 class _Entry(ctypes.LittleEndianStructure):
+    """MAHM_SHARED_MEMORY_ENTRY as declared in MSI Afterburner's SDK header.
+
+    Field names follow the SDK because the last two floats are minLimit and
+    maxLimit — the range of the sensor's own graph, not observed session
+    values. Reading maxLimit as a "session max" produced bars pinned at full
+    width. Offsets and total size are unchanged.
+    """
+
     _pack_ = 1
     _fields_ = [
-        ("srcName",  ctypes.c_char * MAX_PATH),
-        ("srcUnits", ctypes.c_char * MAX_PATH),
-        ("locName",  ctypes.c_char * MAX_PATH),
-        ("locUnits", ctypes.c_char * MAX_PATH),
-        ("locDesc",  ctypes.c_char * MAX_PATH),
-        ("data",     ctypes.c_float),
-        ("minVal",   ctypes.c_float),
-        ("maxVal",   ctypes.c_float),
-        ("fmt",      ctypes.c_uint32),
-        ("flags",    ctypes.c_uint32),
-        ("locId",    ctypes.c_uint32),
+        ("srcName",   ctypes.c_char * MAX_PATH),
+        ("srcUnits",  ctypes.c_char * MAX_PATH),
+        ("locName",   ctypes.c_char * MAX_PATH),
+        ("locUnits",  ctypes.c_char * MAX_PATH),
+        ("locFormat", ctypes.c_char * MAX_PATH),   # szRecommendedFormat
+        ("data",      ctypes.c_float),
+        ("min_limit", ctypes.c_float),             # minimum limit for graphs
+        ("max_limit", ctypes.c_float),             # maximum limit for graphs
+        ("flags",     ctypes.c_uint32),
+        ("gpu",       ctypes.c_uint32),            # v2.0+ data source GPU index
+        ("src_id",    ctypes.c_uint32),            # v2.0+ data source ID
     ]
 
 
@@ -57,6 +65,21 @@ _k32.OpenFileMappingW.restype  = ctypes.c_void_p
 _k32.MapViewOfFile.restype     = ctypes.c_void_p
 _k32.UnmapViewOfFile.argtypes  = [ctypes.c_void_p]
 _k32.CloseHandle.argtypes      = [ctypes.c_void_p]
+
+
+def _usable_max(value: float, limit: float) -> float | None:
+    """Return the progress-bar scale for a sensor, or None to use its bar_max.
+
+    MAHM reports minLimit/maxLimit — the sensor's own graph range, not a session
+    maximum. It is unusable when it is missing or zero (older layouts report 0)
+    and also when the live value has outgrown it: a 5455 MHz clock on a
+    5000 MHz scale would clamp at full width and stop conveying anything.
+    """
+    if not (math.isfinite(limit) and 0 < limit < 3.4e38):
+        return None
+    if math.isfinite(value) and value > limit:
+        return None
+    return limit
 
 
 def read_mahm() -> dict:
@@ -90,12 +113,12 @@ def read_mahm() -> dict:
                 e = _Entry.from_buffer(_entry_buf)
                 n = e.srcName.decode("utf-8", errors="ignore").rstrip("\x00").lower()
                 if n:
-                    v   = e.data
-                    mxv = e.maxVal
+                    v = e.data
                     if math.isfinite(v) and v < 3.4e38:
-                        mx = mxv if (math.isfinite(mxv) and 0 < mxv < 3.4e38) else v
-                        out[n] = (v, mx)
-            except Exception:
+                        out[n] = (v, _usable_max(v, e.max_limit))
+            except Exception as e:
+                _log.warning("MAHM entry %d unreadable (%s: %s) — returning the %d sensor(s) "
+                             "read so far", i, type(e).__name__, e, len(out))
                 break
         if out:
             global _mahm_sensor_count
@@ -280,10 +303,14 @@ _WIN_FALLBACKS = {
 
 # ── Sensor pick helpers ───────────────────────────────────────────────────────
 def _pick_sensor(raw: dict, candidates: tuple) -> tuple[float | None, float | None]:
-    """Return (current_val, session_max) for the first matching candidate.
+    """Return (current_val, bar_scale) for the first matching candidate.
 
     Exact name match wins over substring match, so e.g. the "framerate"
     candidate picks "framerate" and not "framerate 1% low".
+
+    Candidates must stay component-specific: a bare generic entry such as
+    "power" matches whichever MAHM source comes first and silently reports
+    another component's value (GPU PWR showing CPU package power).
     """
     for c in candidates:
         tup = raw.get(c)
@@ -297,10 +324,12 @@ def _pick_sensor(raw: dict, candidates: tuple) -> tuple[float | None, float | No
 
 
 def get_data(sensors: list) -> tuple[dict, dict, str]:
-    """Return ({key: val}, {key: session_max}, source_label).
+    """Return ({key: val}, {key: bar_scale}, source_label).
 
     sensors: list of SensorDef (from cfg.active_sensor_defs(cfg))
-    session_max is MAHM's maxVal for MAHM sensors; bar_max for Windows API sensors.
+    bar_scale is MAHM's graph max limit when usable (see _usable_max), else
+    None — the overlay then falls back to the sensor's catalogue bar_max.
+    Windows API sensors always report bar_max.
     """
     raw = read_mahm()
     vals: dict  = {}
@@ -329,7 +358,8 @@ def get_data(sensors: list) -> tuple[dict, dict, str]:
             if fn:
                 try:
                     vals[s.key] = fn()
-                except Exception:
+                except Exception as e:
+                    _log.warning("Sensor %s read failed (%s: %s)", s.key, type(e).__name__, e)
                     vals[s.key] = None
             else:
                 vals[s.key] = None

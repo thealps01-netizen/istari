@@ -15,8 +15,12 @@ from logger import LOG_DIR, get_logger
 _log = get_logger("crash_handler")
 
 
-def _write_crash_log(exc_type, exc_value, exc_tb) -> tuple[str, str]:
-    """Write crash details to a timestamped file. Returns (path, traceback)."""
+def _write_crash_log(exc_type, exc_value, exc_tb) -> tuple[str | None, str]:
+    """Write crash details to a timestamped file. Returns (path, traceback).
+
+    `path` is None when the file could not be written, so the dialog can say so
+    instead of claiming a report that does not exist.
+    """
     ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(LOG_DIR, f"crash_{ts}.log")
     tb   = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
@@ -25,12 +29,23 @@ def _write_crash_log(exc_type, exc_value, exc_tb) -> tuple[str, str]:
             f.write(f"Istari crash report — {datetime.datetime.now()}\n")
             f.write("=" * 60 + "\n\n")
             f.write(tb)
-    except Exception:
-        pass
+    except Exception as e:
+        _log.error("Could not write crash log to %s (%s: %s)", path, type(e).__name__, e)
+        return None, tb
     return path, tb
 
 
-def _show_crash_dialog(crash_path: str, tb_text: str) -> None:
+def _crash_message(crash_path: str | None) -> str:
+    """Body text of the crash dialog — names a log file only if one was saved."""
+    if crash_path:
+        return ("Istari hit an unexpected error.\n\n"
+                f"Crash log saved to:\n{crash_path}")
+    return ("Istari hit an unexpected error.\n\n"
+            "The crash log could not be written (the log folder is not writable).\n"
+            "The details are below.")
+
+
+def _show_crash_dialog(crash_path: str | None, tb_text: str) -> None:
     """Show a Qt dialog if QApplication is running, otherwise print."""
     try:
         from PyQt6.QtWidgets import QMessageBox, QApplication
@@ -39,17 +54,14 @@ def _show_crash_dialog(crash_path: str, tb_text: str) -> None:
             return
 
         msg = QMessageBox()
-        msg.setWindowTitle("Istari — Beklenmedik Hata")
+        msg.setWindowTitle("Istari — Unexpected Error")
         msg.setIcon(QMessageBox.Icon.Critical)
-        msg.setText(
-            "Uygulama beklenmedik bir hatayla karşılaştı.\n\n"
-            f"Crash log kaydedildi:\n{crash_path}"
-        )
+        msg.setText(_crash_message(crash_path))
         msg.setDetailedText(tb_text)
 
-        open_btn = msg.addButton("Log Klasörünü Aç", QMessageBox.ButtonRole.ActionRole)
-        copy_btn = msg.addButton("Kopyala",          QMessageBox.ButtonRole.ActionRole)
-        msg.addButton("Kapat",                        QMessageBox.ButtonRole.RejectRole)
+        open_btn = msg.addButton("Open Log Folder", QMessageBox.ButtonRole.ActionRole)
+        copy_btn = msg.addButton("Copy",            QMessageBox.ButtonRole.ActionRole)
+        msg.addButton("Close",                      QMessageBox.ButtonRole.RejectRole)
 
         msg.exec()
 

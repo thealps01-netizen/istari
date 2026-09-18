@@ -27,32 +27,22 @@ jobs:
       - name: Run tests
         run: pytest tests/ -v
 
-      - name: Get version from tag
-        id: version
+      # Single writer of the version metadata: version.py, file_version_info.txt
+      # and istari.iss all come from tools/version_sync.py. The tag is passed
+      # through the environment, and the script itself only accepts
+      # vMAJOR.MINOR.PATCH, so the value never reaches a shell unvalidated.
+      - name: Write version.py from the release tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python tools/version_sync.py --from-tag "$RELEASE_TAG"
+
+      - name: Verify the version metadata is consistent
+        run: python tools/version_sync.py --check
+
+      - name: Expose the validated version to later steps
+        id: ver
         shell: bash
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-
-      - name: Inject version into file_version_info.txt
-        shell: pwsh
-        run: |
-          $v = "${{ steps.version.outputs.VERSION }}"
-          $vt = $v -replace '\.', ', '
-          (Get-Content file_version_info.txt) `
-            -replace "filevers=\(.*?\)", "filevers=($vt, 0)" `
-            -replace "prodvers=\(.*?\)", "prodvers=($vt, 0)" `
-            -replace "'FileVersion',\s*'.*?'", "'FileVersion', '$v.0'" `
-            -replace "'ProductVersion',\s*'.*?'", "'ProductVersion', '$v.0'" |
-          Set-Content file_version_info.txt
-
-      - name: Inject version into version.py
-        shell: pwsh
-        run: |
-          $v = "${{ steps.version.outputs.VERSION }}"
-          $vt = $v -replace '\.', ', '
-          (Get-Content version.py) `
-            -replace '__version__\s*=\s*"[^"]*"', "__version__      = `"$v`"" `
-            -replace '__version_tuple__\s*=\s*\([^)]*\)', "__version_tuple__ = ($vt)" |
-          Set-Content version.py
+        run: echo "VERSION=$(python -c 'from version import __version__; print(__version__)')" >> "$GITHUB_OUTPUT"
 
       - name: Generate icon
         run: python tools/make_icon.py
@@ -66,7 +56,7 @@ jobs:
       - name: Build installer
         shell: pwsh
         run: |
-          $version = "${{ steps.version.outputs.VERSION }}"
+          $version = "${{ steps.ver.outputs.VERSION }}"
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" istari.iss
 
       - name: Generate SHA256 checksum

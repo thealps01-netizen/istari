@@ -26,7 +26,8 @@ Real-time FPS, GPU/CPU usage, temperatures, power draw, clocks and RAM — right
 - **Fully customizable** — per-sensor colors, opacity, hover opacity, poll rate, theme
 - **Drag to reposition** or lock in place
 - **System tray** integration with right-click context menu
-- **Auto-update** — silently checks GitHub Releases on startup and installs updates
+- **Auto-update** — silently checks GitHub Releases on startup and installs updates (the
+  installer is only run when its published SHA256 matches; an unverifiable release is refused)
 - **Windows startup** support via registry
 - **Dark & Light themes** with Windows High Contrast accessibility support
 - **Rotating logs** + crash handler with detailed reports
@@ -41,7 +42,7 @@ Real-time FPS, GPU/CPU usage, temperatures, power draw, clocks and RAM — right
 | GPU Usage / GPU2 Usage | % | MSI Afterburner |
 | GPU Temp / GPU Hotspot | °C | MSI Afterburner |
 | GPU Power | W | MSI Afterburner |
-| GPU Clock / GPU Fan | MHz / rpm | MSI Afterburner |
+| GPU Clock / GPU Fan | MHz / % | MSI Afterburner |
 | VRAM Usage | MB | MSI Afterburner |
 | CPU Usage | % | MSI Afterburner |
 | CPU Temp | °C | MSI Afterburner |
@@ -62,7 +63,8 @@ Real-time FPS, GPU/CPU usage, temperatures, power draw, clocks and RAM — right
 ## Installation
 
 1. Go to [**Releases**](https://github.com/thealps01-netizen/istari/releases/latest)
-2. Download `Istari_Setup.exe`
+2. Download the setup file. Releases up to **v1.0.22** publish it as `Palantir_Setup.exe`
+   (the app's former name); from the next release on it is `Istari_Setup.exe`.
 3. Run the installer
 
 > **Windows SmartScreen warning:** You may see "Windows protected your PC" on first run.
@@ -82,9 +84,9 @@ Real-time FPS, GPU/CPU usage, temperatures, power draw, clocks and RAM — right
 
 | Option | Description |
 |--------|-------------|
-| Opacity | Overlay opacity when idle (10–100%) |
-| Hover Opacity | Opacity when mouse is over the overlay |
-| Update Interval | Sensor polling rate (250ms – 5s) |
+| Opacity | Overlay opacity when idle (20–100%) |
+| Hover Opacity | Opacity when mouse is over the overlay (5–80%) |
+| Update Interval | Sensor polling rate (500 ms – 5 s) |
 | Theme | Dark or Light |
 | Always on Top | Keep overlay above all windows |
 | Launch at startup | Start with Windows |
@@ -119,7 +121,10 @@ Requires [PyInstaller](https://pyinstaller.org) and [Inno Setup 6](https://jrsof
 build.bat
 ```
 
-Produces `installer/Istari_Setup.exe` — a self-contained Windows installer.
+`build.bat` creates its own pinned virtual environment at
+`%LOCALAPPDATA%\Istari\build-venv` (outside the repository) instead of installing build
+dependencies into your global Python, and produces `installer/Istari_Setup.exe` — a
+self-contained Windows installer.
 
 ---
 

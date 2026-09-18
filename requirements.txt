@@ -1,3 +1,12 @@
-PyQt6>=6.4.0
-Pillow>=10.0.0
-numpy>=1.24.0
+# Runtime dependencies — exact pins on purpose.
+#
+# The installer is built from this file, so a floating version would mean a
+# different PyQt6 (and a different Qt runtime) in every release. Update the pins
+# deliberately, after running the test suite against the new versions.
+#
+# Icon generation needs Pillow and numpy, but only at build time: those live in
+# requirements-dev.txt so the shipped app does not depend on them.
+
+PyQt6==6.11.0
+PyQt6-Qt6==6.11.2      # the Qt runtime a PyQt6 wheel is built against
+PyQt6-sip==13.12.0     # PyQt6's binding layer

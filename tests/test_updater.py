@@ -11,7 +11,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from updater import _parse, _is_newer, _find_installer_asset, _fetch_latest
+from updater import (_parse, _is_newer, _find_installer_asset, _fetch_latest,
+                     _fetch_expected_sha256, _sha256_of, _friendly_error)
 
 
 # ── _parse ────────────────────────────────────────────────────────────────────
@@ -185,31 +186,87 @@ def test_sha256_match_succeeds():
     assert finished_paths[0].endswith(".exe")
 
 
-def test_sha256_no_sidecar_continues():
-    """When .sha256 sidecar is missing, download should still complete (with warning)."""
-    import tempfile
+def _stub_downloader(url="https://example.com/Istari_Setup.exe"):
+    """InstallerDownloader with its Qt signals and thread replaced by stubs."""
     from updater import InstallerDownloader
 
-    content = b"exe without sidecar"
-    finished_paths = []
+    d = InstallerDownloader.__new__(InstallerDownloader)
+    d._url = url
+    d._thread = MagicMock()
+    d.progress = MagicMock()
+    d.progress.emit = MagicMock()
+    errors, finished = [], []
+    d.error = MagicMock()
+    d.error.emit = errors.append
+    d.finished = MagicMock()
+    d.finished.emit = finished.append
+    return d, errors, finished
 
-    def fake_urlretrieve(url, dest, reporthook=None):
-        with open(dest, "wb") as f:
-            f.write(content)
 
-    with patch("updater.urllib.request.urlretrieve", side_effect=fake_urlretrieve):
+def _fake_sidecar(text: str):
+    resp = MagicMock()
+    resp.__enter__ = lambda s: s
+    resp.__exit__ = MagicMock(return_value=False)
+    resp.read.return_value = text.encode()
+    return resp
+
+
+# ── The checksum is mandatory: an unverified installer is never run ───────────
+
+def test_missing_checksum_sidecar_refuses_to_install():
+    """HTTP 404 for <url>.sha256 must stop the update, not install anyway.
+
+    The downloaded exe is executed elevated, so "could not verify" has to fail
+    closed — it used to be a log warning and the install went ahead.
+    """
+    d, errors, finished = _stub_downloader()
+
+    with patch("updater.urllib.request.urlretrieve",
+               side_effect=lambda url, dest, reporthook=None: open(dest, "wb").write(b"exe")):
         with patch("updater.urllib.request.urlopen",
-                   side_effect=urllib.error.URLError("no sidecar")):
-            downloader = InstallerDownloader.__new__(InstallerDownloader)
-            downloader._url = "https://example.com/Istari_Setup.exe"
-            downloader.error = MagicMock()
-            downloader.finished = MagicMock()
-            downloader.finished.emit = lambda p: finished_paths.append(p)
-            downloader.progress = MagicMock()
-            downloader.progress.emit = MagicMock()
-            downloader._thread = MagicMock()
+                   side_effect=urllib.error.HTTPError(
+                       url="", code=404, msg="Not Found", hdrs=None, fp=None)):
+            d._run()
 
-            downloader._run()
+    assert finished == []
+    assert len(errors) == 1
+    assert "checksum" in errors[0].lower()
 
-    # Should still finish (sidecar absence is not fatal)
-    assert len(finished_paths) == 1
+
+def test_checksum_fetch_network_error_refuses_to_install():
+    """A network failure while reading the checksum is not "no checksum exists"."""
+    d, errors, finished = _stub_downloader()
+
+    with patch("updater.urllib.request.urlretrieve",
+               side_effect=lambda url, dest, reporthook=None: open(dest, "wb").write(b"exe")):
+        with patch("updater.urllib.request.urlopen",
+                   side_effect=urllib.error.URLError("no network")):
+            d._run()
+
+    assert finished == []
+    assert len(errors) == 1
+
+
+def test_fetch_expected_sha256_parses_sidecar():
+    with patch("updater.urllib.request.urlopen",
+               return_value=_fake_sidecar("B61319AE8956  Istari_Setup.exe\n")):
+        assert _fetch_expected_sha256("https://example.com/x.exe") == "b61319ae8956"
+
+
+def test_fetch_expected_sha256_empty_body_is_none():
+    with patch("updater.urllib.request.urlopen", return_value=_fake_sidecar("")):
+        assert _fetch_expected_sha256("https://example.com/x.exe") is None
+
+
+def test_sha256_of_matches_hashlib(tmp_path):
+    p = tmp_path / "blob.bin"
+    p.write_bytes(b"payload")
+    assert _sha256_of(str(p)) == hashlib.sha256(b"payload").hexdigest()
+
+
+def test_unverified_update_error_is_user_friendly():
+    title, body = _friendly_error(
+        "No SHA256 checksum published for this release, so the installer cannot be verified."
+    )
+    assert title == "Update Could Not Be Verified"
+    assert "manually" in body

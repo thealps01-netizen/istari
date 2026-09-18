@@ -87,6 +87,43 @@ def _find_installer_asset(release: dict) -> str | None:
     return None
 
 
+def _fetch_expected_sha256(installer_url: str) -> str | None:
+    """SHA256 published beside the installer (`<url>.sha256`), or None.
+
+    None means no usable checksum could be read — missing asset, network
+    failure, empty body. The caller must refuse to install in that case: the
+    downloaded file is about to be executed with administrator rights.
+    """
+    try:
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(
+            urllib.request.Request(
+                installer_url + ".sha256",
+                headers={"User-Agent": "Istari-Updater/1.0"},
+            ),
+            timeout=TIMEOUT,
+            context=ctx,
+        ) as r:
+            parts = r.read().decode("utf-8", errors="replace").split()
+    except urllib.error.HTTPError as e:
+        _log.warning("Checksum sidecar missing for %s (HTTP %s)", installer_url, e.code)
+        return None
+    except Exception as e:
+        _log.warning("Could not fetch checksum sidecar for %s (%s: %s)",
+                     installer_url, type(e).__name__, e)
+        return None
+    return parts[0].strip().lower() if parts else None
+
+
+def _sha256_of(path: str) -> str:
+    """SHA256 of a file, read in chunks so a large installer is not buffered."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 # ── Background checker ─────────────────────────────────────────────────────────
 
 class UpdateChecker(QObject):
@@ -180,23 +217,17 @@ class InstallerDownloader(QObject):
             self.progress.emit(100)
             _log.info("Download complete: %s", dest)
 
-            # SHA256 integrity check — download .sha256 sidecar if available
-            sha256_url = self._url + ".sha256"
-            try:
-                ctx = ssl.create_default_context()
-                with urllib.request.urlopen(
-                    urllib.request.Request(sha256_url, headers={"User-Agent": "Istari-Updater/1.0"}),
-                    timeout=TIMEOUT,
-                    context=ctx,
-                ) as r:
-                    expected_hash = r.read().decode().split()[0].strip().lower()
-                with open(dest, "rb") as _f:
-                    actual_hash = hashlib.sha256(_f.read()).hexdigest()
-                if actual_hash != expected_hash:
-                    raise ValueError(f"SHA256 mismatch: expected {expected_hash}, got {actual_hash}")
-                _log.info("SHA256 verified OK: %s", actual_hash)
-            except urllib.error.URLError:
-                _log.warning("No .sha256 sidecar found — installer integrity not verified")
+            # Integrity check — an unverified installer is never executed.
+            expected_hash = _fetch_expected_sha256(self._url)
+            if not expected_hash:
+                raise RuntimeError(
+                    "No SHA256 checksum published for this release, so the "
+                    "installer cannot be verified."
+                )
+            actual_hash = _sha256_of(dest)
+            if actual_hash != expected_hash:
+                raise ValueError(f"SHA256 mismatch: expected {expected_hash}, got {actual_hash}")
+            _log.info("SHA256 verified OK: %s", actual_hash)
 
             self.finished.emit(dest)
         except Exception as e:
@@ -506,6 +537,13 @@ class DownloadProgressDialog(_DraggableDialog):
 def _friendly_error(raw: str) -> tuple[str, str]:
     """Return (title, body) user-friendly message from a raw exception string."""
     r = raw.lower()
+    if "checksum" in r or "sha256" in r:
+        return (
+            "Update Could Not Be Verified",
+            "This release does not publish a valid SHA256 checksum, so the\n"
+            "installer was not run. Download it manually from the release page\n"
+            "and install it yourself.",
+        )
     if "getaddrinfo" in r or "name or service not known" in r or "nodename nor servname" in r:
         return (
             "No Internet Connection",
