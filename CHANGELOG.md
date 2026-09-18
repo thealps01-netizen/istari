@@ -6,7 +6,36 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [1.0.24] — 2026-09-18
+
+### Fixed
+- **A release is now stamped with the version it is published as.** The release workflow wrote
+  the version inside a PowerShell step, where the variable it referenced resolves to nothing
+  (an environment variable needs `$env:` in PowerShell), so `v1.0.23` was built and published
+  stamped `1.0.22`: an installed copy reports the previous version and keeps offering an
+  update it already has. The step runs under bash now, the writer refuses an empty tag instead
+  of quietly reporting success, and `--from-tag` writes the derived files too — the workflow
+  had no `--inject` step at all.
+- `FileVersion` and `ProductVersion` in the executable's version resource had been frozen at
+  `1.0.12.0`: the rewriter matched `'FileVersion'` while PyInstaller writes `u'FileVersion'`,
+  and the drift check shared that blind spot, so it never objected. Both fields are rewritten
+  now and `--check` covers them.
+
+### Added
+- Tests for the empty-tag path, the `u`-prefixed version strings and the complete tag →
+  metadata sequence (105 tests total).
+
+### Upgrade note
+- If you installed **v1.0.23**, install this release: v1.0.23 is stamped `1.0.22` internally and
+  will keep offering itself as an update.
+
+---
+
 ## [1.0.23] — 2026-09-18
+
+### Known issue
+- This release is stamped `1.0.22` internally (fixed in 1.0.24): its installer and executable
+  report the previous version. Install **v1.0.24** instead.
 
 ### Changed
 - Release assets are published as `Istari_Setup.exe` and `Istari_Setup.exe.sha256`; earlier

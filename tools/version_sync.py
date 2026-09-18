@@ -64,9 +64,12 @@ def _expected_version_info(version: str) -> str:
     text = VERSION_INFO.read_text(encoding="utf-8")
     text = re.sub(r"filevers=\([^)]*\)", f"filevers=({parts}, 0)", text)
     text = re.sub(r"prodvers=\([^)]*\)", f"prodvers=({parts}, 0)", text)
-    text = re.sub(r"'FileVersion',\s*'[^']*'", f"'FileVersion', '{version}.0'", text)
-    text = re.sub(r"'ProductVersion',\s*'[^']*'",
-                  f"'ProductVersion', '{version}.0'", text)
+    # PyInstaller writes the string fields with a `u` prefix (`u'FileVersion'`); an
+    # optional prefix in the pattern keeps them in step with filevers/prodvers, where
+    # a plain `'FileVersion'` match silently left them at whatever they were.
+    text = re.sub(r"(u?'FileVersion',\s*u?)'[^']*'", rf"\g<1>'{version}.0'", text)
+    text = re.sub(r"(u?'ProductVersion',\s*u?)'[^']*'",
+                  rf"\g<1>'{version}.0'", text)
     return text
 
 
@@ -122,10 +125,24 @@ def main(argv: list[str] | None = None) -> int:
                        help="report drift and exit 1 without writing anything")
     args = parser.parse_args(argv)
 
-    if args.from_tag:
-        changed = sync_version_py(args.from_tag)
+    if args.from_tag is not None:
+        # Dispatch on `is not None`, never on truthiness: a workflow that fails to
+        # expand its tag variable passes an empty string, and treating that as "not
+        # requested" let the step report success without writing anything.
+        tag = args.from_tag.strip()
+        if not tag:
+            print("--from-tag needs a tag, got an empty value", file=sys.stderr)
+            return 2
+        changed = sync_version_py(tag)
         print(f"version.py -> {read_version()}" if changed
               else f"version.py already at {read_version()}")
+        for line in inject():
+            print(line)
+        stale = drift()
+        if stale:
+            print("version metadata still out of sync after writing: "
+                  + ", ".join(stale), file=sys.stderr)
+            return 1
         return 0
 
     if args.inject:

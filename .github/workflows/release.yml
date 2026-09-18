@@ -31,7 +31,14 @@ jobs:
       # and istari.iss all come from tools/version_sync.py. The tag is passed
       # through the environment, and the script itself only accepts
       # vMAJOR.MINOR.PATCH, so the value never reaches a shell unvalidated.
-      - name: Write version.py from the release tag
+      #
+      # `shell: bash` is load-bearing: the runner's default is PowerShell, where
+      # "$RELEASE_TAG" is a PowerShell variable (empty, no error) instead of the
+      # environment variable, and the step would then ship the version already in
+      # the tree. `--from-tag` also writes the derived files, so the tree cannot
+      # keep a stale one.
+      - name: Write the version metadata from the release tag
+        shell: bash
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: python tools/version_sync.py --from-tag "$RELEASE_TAG"

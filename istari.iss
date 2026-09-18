@@ -1,6 +1,6 @@
 #define AppName    "Istari"
 #ifndef AppVersion
-  #define AppVersion "1.0.22"
+  #define AppVersion "1.0.24"
 #endif
 #define AppExe     "Istari.exe"
 #define AppDir     "dist\Istari"

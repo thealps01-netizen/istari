@@ -20,8 +20,8 @@ VERSION_PY_SAMPLE = '__version__      = "1.0.22"\n__version_tuple__ = (1, 0, 22)
 INFO_SAMPLE = """VSVersionInfo(
   ffi=FixedFileInfo(filevers=(1, 0, 12, 0), prodvers=(1, 0, 12, 0)),
   kids=[StringFileInfo([StringTable('040904B0', [
-      StringStruct('FileVersion', '1.0.12.0'),
-      StringStruct('ProductVersion', '1.0.12.0')])])])
+      StringStruct(u'FileVersion',      u'1.0.12.0'),
+      StringStruct(u'ProductVersion',   u'1.0.12.0')])])])
 """
 
 ISS_SAMPLE = '#ifndef AppVersion\n  #define AppVersion "1.0.12"\n#endif\n'
@@ -50,8 +50,9 @@ def test_inject_writes_both_derived_files(tree):
     assert written == ["file_version_info.txt -> 1.0.22", "istari.iss AppVersion -> 1.0.22"]
     info = (tree / "file_version_info.txt").read_text()
     assert "filevers=(1, 0, 22, 0)" in info
-    assert "'FileVersion', '1.0.22.0'" in info
-    assert "'ProductVersion', '1.0.22.0'" in info
+    assert "'FileVersion'" in info and "u'1.0.22.0'" in info
+    assert "'ProductVersion'" in info and "u'1.0.22.0'" in info
+    assert "1.0.12.0" not in info
     assert '#define AppVersion "1.0.22"' in (tree / "istari.iss").read_text()
     assert version_sync.drift() == []
 
@@ -82,3 +83,38 @@ def test_from_tag_rejects_a_non_semver_tag(tree):
 
 def test_drift_lists_stale_files(tree):
     assert version_sync.drift() == ["file_version_info.txt", "istari.iss"]
+
+
+def test_version_strings_are_rewritten_with_or_without_the_u_prefix(tree):
+    """PyInstaller writes `u'FileVersion'`; a hand-edited file may omit the prefix.
+    Both forms have to be rewritten."""
+    plain = ("StringStruct('FileVersion', '1.0.12.0'),\n"
+             "StringStruct('ProductVersion', '1.0.12.0')\n")
+    (tree / "file_version_info.txt").write_text(plain, encoding="utf-8")
+
+    version_sync.inject()
+
+    written = (tree / "file_version_info.txt").read_text()
+    assert "'FileVersion', '1.0.22.0'" in written
+    assert "'ProductVersion', '1.0.22.0'" in written
+    assert "1.0.12.0" not in written
+
+
+def test_from_tag_with_an_empty_value_fails_instead_of_reporting_success(tree):
+    """A workflow whose tag variable did not expand passes "" — that used to fall
+    through to the check branch, exit 0, and ship a release stamped with the version
+    already in the tree."""
+    assert version_sync.main(["--from-tag", ""]) == 2
+    assert (tree / "version.py").read_text() == VERSION_PY_SAMPLE
+
+
+def test_from_tag_writes_version_py_and_the_derived_files(tree):
+    """The whole release sequence in one call: version.py from the tag, then the
+    derived files, ending in a tree that --check accepts."""
+    assert version_sync.main(["--from-tag", "v1.0.23"]) == 0
+
+    assert '__version__      = "1.0.23"' in (tree / "version.py").read_text()
+    assert "filevers=(1, 0, 23, 0)" in (tree / "file_version_info.txt").read_text()
+    assert "u'1.0.23.0'" in (tree / "file_version_info.txt").read_text()
+    assert '#define AppVersion "1.0.23"' in (tree / "istari.iss").read_text()
+    assert version_sync.drift() == []
