@@ -6,9 +6,12 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
-## [Unreleased]
+## [1.0.23] — 2026-09-18
 
 ### Changed
+- Release assets are published as `Istari_Setup.exe` and `Istari_Setup.exe.sha256`; earlier
+  releases shipped them as `Palantir_Setup.exe`. Those stay in place — they are the builds
+  that were actually made under the old name.
 - **Renamed Palantir → Istari** everywhere: the app, installer, settings folder and the
   Windows autostart entry. Settings saved under the old name are adopted once
   (`%LOCALAPPDATA%\Palantir\settings.json` is copied, never moved); a stale `Palantir`
@@ -36,7 +39,12 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 - Regression tests for the update integrity path, the crash-log contract, startup-registry
-  failures and version-metadata drift (99 tests total).
+  failures, the log location and version-metadata drift (102 tests total).
+
+### Upgrade note
+- The installer uses a new application identity, so it installs alongside an existing
+  Palantir build instead of replacing it. Uninstall **Palantir** from *Add or remove
+  programs* once Istari is installed.
 
 ---
 

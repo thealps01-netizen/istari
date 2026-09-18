@@ -48,6 +48,7 @@ Real-time FPS, GPU/CPU usage, temperatures, power draw, clocks and RAM — right
 | CPU Temp | °C | MSI Afterburner |
 | CPU Power / CPU Clock | W / MHz | MSI Afterburner |
 | RAM Usage | % | Windows API |
+| Ping | ms | TCP probe |
 
 ---
 
@@ -63,9 +64,13 @@ Real-time FPS, GPU/CPU usage, temperatures, power draw, clocks and RAM — right
 ## Installation
 
 1. Go to [**Releases**](https://github.com/thealps01-netizen/istari/releases/latest)
-2. Download the setup file. Releases up to **v1.0.22** publish it as `Palantir_Setup.exe`
-   (the app's former name); from the next release on it is `Istari_Setup.exe`.
+2. Download `Istari_Setup.exe`. Releases up to **v1.0.22** published it as
+   `Palantir_Setup.exe`, the app's former name.
 3. Run the installer
+
+> **Upgrading from the old Palantir build?** The installer uses a new application identity,
+> so it does not replace an existing Palantir installation: uninstall **Palantir** from
+> *Add or remove programs* first, otherwise two overlays can end up running side by side.
 
 > **Windows SmartScreen warning:** You may see "Windows protected your PC" on first run.
 > Click **More info → Run anyway**. This is normal for unsigned open-source apps.
