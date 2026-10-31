@@ -20,7 +20,7 @@ All tests must pass before submitting a pull request.
 
 ## Making Changes
 
-1. Fork the repository and create a branch from `master`
+1. Fork the repository and create a branch from `main`
 2. Make your changes
 3. Run the test suite — all tests must pass
 4. Open a pull request with a clear description of what was changed and why

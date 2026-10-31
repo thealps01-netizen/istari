@@ -13,7 +13,7 @@ Only the latest release receives security fixes.
 
 **Please do not open a public GitHub issue for security vulnerabilities.**
 
-Report security issues privately by emailing the maintainer directly. You can find contact information on the [GitHub profile](https://github.com/thealps01-netizen).
+Report security issues privately on GitHub: open this repository's **Security** tab and choose **Report a vulnerability** (<https://github.com/thealps01-netizen/istari/security/advisories/new>).
 
 Include in your report:
 - Description of the vulnerability
