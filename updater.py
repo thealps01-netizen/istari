@@ -844,11 +844,21 @@ def _show_download_error(raw: str, parent=None) -> None:
     _show_message(title, body, parent)
 
 
-ERROR_CANCELLED = 1223   # ERROR_CANCELLED: the user declined the UAC prompt
+SETUP_MUTEX = "IstariSetupMutex"   # must match SetupMutex= in istari.iss
+SETUP_EXIT_DECLINED = 2            # Inno Setup exit code: UAC prompt declined / elevation failed
+_SYNCHRONIZE = 0x00100000
+_ERROR_ACCESS_DENIED = 5
+_SEE_MASK_NOCLOSEPROCESS = 0x00000040
+_POLL_MS = 200
 
 
-def _launch_installer(path: str) -> int | None:
-    """Start the installer elevated. None when it started, else the Win32 error."""
+def _launch_installer(path: str) -> tuple[int | None, int | None]:
+    """Start the installer unelevated; Setup elevates itself (PrivilegesRequired=admin).
+
+    Returns (error, process handle). error is None when it started, else the Win32
+    error. Starting it with "runas" would make Setup begin already elevated, which
+    turns off the runasoriginaluser flag and relaunches Istari as administrator.
+    """
     import ctypes
 
     # ShellExecuteExW — proper struct-based API, avoids return-type truncation
@@ -874,45 +884,118 @@ def _launch_installer(path: str) -> int | None:
 
     sei = _SEI()
     sei.cbSize       = ctypes.sizeof(_SEI)
-    sei.lpVerb       = "runas"
+    sei.fMask        = _SEE_MASK_NOCLOSEPROCESS
+    sei.lpVerb       = "open"
     sei.lpFile       = path
     sei.lpParameters = "/VERYSILENT /NORESTART"
     sei.lpDirectory  = os.path.dirname(path)
-    sei.nShow        = 1  # SW_SHOWNORMAL (so UAC dialog is visible)
+    sei.nShow        = 1  # SW_SHOWNORMAL
 
     shell32 = ctypes.windll.shell32
     shell32.ShellExecuteExW.restype = ctypes.c_bool
     if shell32.ShellExecuteExW(ctypes.byref(sei)):
+        return None, sei.hProcess
+    return ctypes.windll.kernel32.GetLastError(), None
+
+
+def _setup_mutex_seen() -> bool:
+    """True once the elevated Setup process exists (the UAC prompt was accepted).
+
+    Setup creates SETUP_MUTEX only after elevating; a mutex owned by an elevated
+    process may deny SYNCHRONIZE to us, which proves it exists just as well.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.windll.kernel32
+    k32.OpenMutexW.restype = wintypes.HANDLE
+    k32.OpenMutexW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    h = k32.OpenMutexW(_SYNCHRONIZE, False, SETUP_MUTEX)
+    if h:
+        k32.CloseHandle(h)
+        return True
+    return k32.GetLastError() == _ERROR_ACCESS_DENIED
+
+
+def _process_exit_code(handle) -> int | None:
+    """Exit code of the process, or None while it is still running (never blocks)."""
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.windll.kernel32
+    k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    if k32.WaitForSingleObject(handle, 0) != 0:   # WAIT_OBJECT_0 only once it exited
         return None
-    return ctypes.windll.kernel32.GetLastError()
+    code = wintypes.DWORD()
+    if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+        return 1
+    return code.value
+
+
+def _close_handle(handle) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.windll.kernel32
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.CloseHandle(handle)
 
 
 def _start_install(path: str, prog, quit_fn, parent=None) -> bool:
-    """Run the verified installer and quit only if it really started.
+    """Run the verified installer; quit once the elevated Setup is really running.
 
-    On failure or a declined UAC prompt the app keeps running and the user is
-    told; quitting here would leave them with no overlay and no update.
+    The app keeps running while the UAC prompt is open. If the prompt is declined or
+    Setup fails, the app stays up and the user is told; quitting would leave them
+    with no overlay and no update. Polls on the Qt thread with zero-timeout waits.
     """
     prog.set_installing()
     _log.info("Launching installer: %s", path)
-    err = _launch_installer(path)
-    if err is None:
-        _log.info("Installer launched via ShellExecuteExW")
-        QTimer.singleShot(500, quit_fn)
-        return True
+    err, handle = _launch_installer(path)
 
-    _log.error("ShellExecuteExW failed (err=%d) — installer not launched", err)
-    prog.done(0)
-    shutil.rmtree(os.path.dirname(path), ignore_errors=True)
-    if err == ERROR_CANCELLED:
-        body = ("The update was not installed because administrator permission "
-                "was not granted.\nIstari keeps running; you can update again "
-                "from the tray menu.")
-    else:
-        body = (f"The installer could not be started (error {err}).\n"
-                "Istari keeps running; you can try again from the tray menu.")
-    _show_message("Update Not Installed", body, parent)
-    return False
+    def _abort(body: str) -> None:
+        prog.done(0)
+        shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+        _show_message("Update Not Installed", body, parent)
+
+    if err is not None:
+        _log.error("ShellExecuteExW failed (err=%d) — installer not launched", err)
+        _abort(f"The installer could not be started (error {err}).\n"
+               "Istari keeps running; you can try again from the tray menu.")
+        return False
+
+    _log.info("Installer loader started; waiting for the elevated Setup")
+
+    def _poll() -> None:
+        if _setup_mutex_seen():
+            _log.info("Elevated Setup is running; quitting for the update")
+            if handle:
+                _close_handle(handle)
+            quit_fn()
+            return
+        code = _process_exit_code(handle) if handle else 0
+        if code is None:
+            QTimer.singleShot(_POLL_MS, _poll)   # UAC prompt may sit open; no timeout
+            return
+        if handle:
+            _close_handle(handle)
+        if code == 0:
+            _log.warning("Installer exited with 0 before its mutex was seen; "
+                         "assuming the install finished")
+            quit_fn()
+        elif code == SETUP_EXIT_DECLINED:
+            _log.error("Installer exited with code 2 — administrator permission not granted")
+            _abort("The update was not installed because administrator permission "
+                   "was not granted.\nIstari keeps running; you can update again "
+                   "from the tray menu.")
+        else:
+            _log.error("Installer exited with code %d before installing", code)
+            _abort(f"The installer failed (exit code {code}).\n"
+                   "Istari keeps running; you can try again from the tray menu.")
+
+    QTimer.singleShot(_POLL_MS, _poll)
+    return True
 
 
 # ── High-level helper called from main UI ──────────────────────────────────────

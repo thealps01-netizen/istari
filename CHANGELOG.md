@@ -9,6 +9,8 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ## [Unreleased]
 
 ### Fixed
+- **No administrator rights after an update.** After an automatic update Istari now restarts
+  with normal (non-administrator) rights instead of as administrator.
 - **Updates no longer take the app down with them.** If the installer is declined at the UAC
   prompt or fails to start, Istari says so and keeps running instead of quitting. The update
   check always finishes. A failed manual check now says why (rate limit, server error, no

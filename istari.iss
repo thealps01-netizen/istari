@@ -34,6 +34,9 @@ UninstallDisplayName={#AppName}
 UninstallDisplayIcon={app}\istari.ico
 SetupIconFile=istari.ico
 PrivilegesRequired=admin
+; Created only by the elevated Setup process; the updater polls it to learn that the
+; UAC prompt was accepted (updater.SETUP_MUTEX).
+SetupMutex=IstariSetupMutex
 MinVersion=10.0
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -54,8 +57,9 @@ Name: "{group}\Uninstall {#AppName}";    Filename: "{uninstallexe}"
 Name: "{userdesktop}\{#AppName}";        Filename: "{app}\{#AppExe}"; IconFilename: "{app}\istari.ico"; Tasks: desktopicon
 
 [Run]
-; The installer runs elevated (PrivilegesRequired=admin, started with "runas" by the
-; updater). runasoriginaluser starts the app with the logged-in user's token instead,
+; The installer runs elevated (PrivilegesRequired=admin: Setup elevates itself; the
+; updater starts it unelevated on purpose, because runasoriginaluser has no effect when
+; Setup is launched from an already-elevated process). runasoriginaluser starts the app with the logged-in user's token instead,
 ; so the overlay is never left running as administrator (istari.manifest: asInvoker).
 ; Interactive install — user can choose to launch from the wizard
 Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent runasoriginaluser

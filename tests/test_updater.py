@@ -233,29 +233,156 @@ def install_spy(monkeypatch):
     return spy
 
 
+@pytest.fixture
+def setup_probe(monkeypatch):
+    """Fake the Win32 probes: the test sets .mutex / .exit_code; handles closed are recorded."""
+    probe = MagicMock()
+    probe.mutex, probe.exit_code, probe.closed = False, None, []
+    monkeypatch.setattr(updater, "_setup_mutex_seen", lambda: probe.mutex)
+    monkeypatch.setattr(updater, "_process_exit_code", lambda h: probe.exit_code)
+    monkeypatch.setattr(updater, "_close_handle", probe.closed.append)
+    return probe
+
+
+def _poll_once(install_spy):
+    """Run the next scheduled poll callback (the app's Qt timer tick)."""
+    install_spy.scheduled.pop(0)()
+
+
 @pytest.mark.parametrize("err", [1223, 5])
-def test_failed_or_declined_launch_keeps_the_app_running(monkeypatch, tmp_path, install_spy, err):
-    monkeypatch.setattr(updater, "_launch_installer", lambda path: err)
+def test_failed_launch_keeps_the_app_running(monkeypatch, tmp_path, install_spy, err):
+    monkeypatch.setattr(updater, "_launch_installer", lambda path: (err, None))
     exe, prog, quit_fn = _installer_in(tmp_path), MagicMock(), MagicMock()
 
     assert updater._start_install(exe, prog, quit_fn) is False
 
-    assert install_spy.scheduled == []            # no quit scheduled
+    assert install_spy.scheduled == []            # no quit, no polling
     quit_fn.assert_not_called()
     prog.done.assert_called_once_with(0)
     assert len(install_spy.shown) == 1            # the user is told
-    assert ("administrator" in install_spy.shown[0][1]) == (err == 1223)
+    assert f"error {err}" in install_spy.shown[0][1]
     assert not os.path.exists(exe)                # verified-but-unused installer removed
 
 
-def test_started_installer_schedules_the_quit(monkeypatch, tmp_path, install_spy):
-    monkeypatch.setattr(updater, "_launch_installer", lambda path: None)
+def test_started_loader_does_not_quit_before_setup_is_elevated(monkeypatch, tmp_path, install_spy, setup_probe):
+    monkeypatch.setattr(updater, "_launch_installer", lambda path: (None, 77))
     quit_fn = MagicMock()
 
     assert updater._start_install(_installer_in(tmp_path), MagicMock(), quit_fn) is True
+    for _ in range(5):                            # UAC prompt sits open: loader alive, no mutex
+        _poll_once(install_spy)
 
-    assert install_spy.scheduled == [quit_fn]
-    assert install_spy.shown == []
+    quit_fn.assert_not_called()
+    assert len(install_spy.scheduled) == 1        # still polling, no timeout
+    assert install_spy.shown == [] and setup_probe.closed == []
+
+
+def test_mutex_seen_quits_and_closes_the_handle(monkeypatch, tmp_path, install_spy, setup_probe):
+    monkeypatch.setattr(updater, "_launch_installer", lambda path: (None, 77))
+    quit_fn = MagicMock()
+    assert updater._start_install(_installer_in(tmp_path), MagicMock(), quit_fn) is True
+
+    setup_probe.mutex = True
+    _poll_once(install_spy)
+
+    quit_fn.assert_called_once_with()
+    assert setup_probe.closed == [77]
+    assert install_spy.scheduled == [] and install_spy.shown == []
+
+
+def test_declined_uac_exit_code_2_keeps_running_and_tells_the_user(monkeypatch, tmp_path, install_spy, setup_probe):
+    monkeypatch.setattr(updater, "_launch_installer", lambda path: (None, 77))
+    exe, prog, quit_fn = _installer_in(tmp_path), MagicMock(), MagicMock()
+    assert updater._start_install(exe, prog, quit_fn) is True
+
+    setup_probe.exit_code = 2
+    _poll_once(install_spy)
+
+    quit_fn.assert_not_called()
+    prog.done.assert_called_once_with(0)
+    assert len(install_spy.shown) == 1
+    assert "administrator permission was not granted" in install_spy.shown[0][1]
+    assert not os.path.exists(exe)
+    assert setup_probe.closed == [77] and install_spy.scheduled == []
+
+
+def test_other_nonzero_exit_code_reports_install_failure(monkeypatch, tmp_path, install_spy, setup_probe):
+    monkeypatch.setattr(updater, "_launch_installer", lambda path: (None, 77))
+    exe, quit_fn = _installer_in(tmp_path), MagicMock()
+    assert updater._start_install(exe, MagicMock(), quit_fn) is True
+
+    setup_probe.exit_code = 5
+    _poll_once(install_spy)
+
+    quit_fn.assert_not_called()
+    assert len(install_spy.shown) == 1
+    assert "exit code 5" in install_spy.shown[0][1]
+    assert "administrator" not in install_spy.shown[0][1]
+    assert not os.path.exists(exe)
+    assert setup_probe.closed == [77]
+
+
+def test_clean_exit_without_seeing_the_mutex_quits(monkeypatch, tmp_path, install_spy, setup_probe):
+    monkeypatch.setattr(updater, "_launch_installer", lambda path: (None, 77))
+    quit_fn = MagicMock()
+    assert updater._start_install(_installer_in(tmp_path), MagicMock(), quit_fn) is True
+
+    setup_probe.exit_code = 0
+    _poll_once(install_spy)
+
+    quit_fn.assert_called_once_with()
+    assert setup_probe.closed == [77] and install_spy.shown == []
+
+
+def _fake_kernel32(monkeypatch, open_result, last_error):
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    fakes = {"OpenMutexW": MagicMock(return_value=open_result),
+             "CloseHandle": MagicMock(return_value=True),
+             "GetLastError": MagicMock(return_value=last_error)}
+    for name, fake in fakes.items():
+        monkeypatch.setattr(k32, name, fake, raising=False)
+    return fakes
+
+
+def test_setup_mutex_seen_when_it_opens(monkeypatch):
+    fakes = _fake_kernel32(monkeypatch, open_result=1234, last_error=0)
+    assert updater._setup_mutex_seen() is True
+    assert fakes["OpenMutexW"].call_args.args == (0x00100000, False, updater.SETUP_MUTEX)
+    fakes["CloseHandle"].assert_called_once_with(1234)
+
+
+def test_setup_mutex_access_denied_counts_as_seen(monkeypatch):
+    _fake_kernel32(monkeypatch, open_result=None, last_error=5)
+    assert updater._setup_mutex_seen() is True
+
+
+def test_setup_mutex_not_found_is_not_seen(monkeypatch):
+    _fake_kernel32(monkeypatch, open_result=None, last_error=2)
+    assert updater._setup_mutex_seen() is False
+
+
+def test_installer_mutex_name_matches_the_iss():
+    iss = open(os.path.join(os.path.dirname(updater.__file__), "istari.iss"), encoding="utf-8").read()
+    assert f"SetupMutex={updater.SETUP_MUTEX}" in iss
+
+
+def test_launch_installer_starts_unelevated_and_keeps_the_process_handle(monkeypatch):
+    import ctypes
+    seen = {}
+
+    def fake_shell_execute(ref):
+        sei = ref._obj
+        seen.update(verb=sei.lpVerb, mask=sei.fMask)
+        sei.hProcess = 4321
+        return True
+
+    shell32 = ctypes.windll.shell32
+    monkeypatch.setattr(shell32, "ShellExecuteExW", fake_shell_execute, raising=False)
+
+    assert updater._launch_installer(r"C:\x\Istari_Setup.exe") == (None, 4321)
+    assert seen["verb"] == "open"                  # never "runas": that defeats runasoriginaluser
+    assert seen["mask"] & 0x40                     # SEE_MASK_NOCLOSEPROCESS
 
 
 def test_launch_installer_reports_the_win32_error_when_shellexecute_fails(monkeypatch):
@@ -264,7 +391,7 @@ def test_launch_installer_reports_the_win32_error_when_shellexecute_fails(monkey
     monkeypatch.setattr(shell32, "ShellExecuteExW", MagicMock(return_value=False), raising=False)
     monkeypatch.setattr(ctypes.windll.kernel32, "GetLastError", lambda: 1223, raising=False)
 
-    assert updater._launch_installer(r"C:\x\Istari_Setup.exe") == 1223
+    assert updater._launch_installer(r"C:\x\Istari_Setup.exe") == (1223, None)
 
 
 # ── UP-2 / UP-7 / UP-9: the checker always finishes and always says something ─
@@ -595,7 +722,7 @@ def _real_progress(qtbot):
 
 
 def test_rup1_failed_launch_hides_the_real_progress_dialog(qtbot, monkeypatch, tmp_path, install_spy):
-    monkeypatch.setattr(updater, "_launch_installer", lambda path: 5)
+    monkeypatch.setattr(updater, "_launch_installer", lambda path: (5, None))
     prog = _real_progress(qtbot)
     assert updater._start_install(_installer_in(tmp_path), prog, MagicMock()) is False
     assert not prog.isVisible()
