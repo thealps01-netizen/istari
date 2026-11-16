@@ -301,3 +301,204 @@ def test_sensor_read_failure_is_logged_and_poll_continues(monkeypatch):
     assert data["ram_usage"] is None
     assert "net_latency" in data            # the poll survived the failure
     assert any("ram_usage" in str(w) for w in rec.warnings)
+
+
+
+# ══ Sensor/RTSS/ping regressions (audit HW-*) ═════════════════════════════════
+import ctypes
+import logging
+import threading
+import time
+
+
+class _View:
+    """A zeroed, addressable byte buffer standing in for a mapped view."""
+
+    def __init__(self, size):
+        self.size = size
+        self.buf = (ctypes.c_byte * size)()
+        self.addr = ctypes.addressof(self.buf)
+
+    def put(self, offset, data: bytes):
+        ctypes.memmove(self.addr + offset, data, len(data))
+
+
+def _mahm_view(names_vals, entry_size=None, claimed_num=None):
+    entry_size = entry_size or hw._ENTRY_SIZE
+    n = len(names_vals)
+    v = _View(hw._HDR_SIZE + n * entry_size)
+    hdr = hw._Hdr(sig=hw.MAHM_SIG, ver=0x20000, headerSize=hw._HDR_SIZE,
+                  num=claimed_num if claimed_num is not None else n,
+                  entrySize=entry_size)
+    v.put(0, bytes(hdr))
+    for i, (name, val) in enumerate(names_vals):
+        e = hw._Entry(srcName=name.encode(), data=val, max_limit=100.0)
+        v.put(hw._HDR_SIZE + i * entry_size, bytes(e)[:entry_size])
+    return v
+
+
+# ── HW-1: RTSS prefers the foreground process ────────────────────────────────
+
+def _rtss_view(apps):
+    """apps: [(pid, time0, time1, frames)]"""
+    v = _View(hw._RTSS_HDR_SIZE + len(apps) * hw._RTSS_APP_SIZE)
+    hdr = hw._RtssHdr(dwSignature=hw.RTSS_SIG, dwVersion=0x00020005,
+                      dwAppEntrySize=hw._RTSS_APP_SIZE, dwAppArrOffset=hw._RTSS_HDR_SIZE,
+                      dwAppArrSize=len(apps))
+    v.put(0, bytes(hdr))
+    for i, (pid, t0, t1, frames) in enumerate(apps):
+        e = hw._RtssAppEntry(dwProcessID=pid, dwTime0=t0, dwTime1=t1, dwFrames=frames)
+        v.put(hw._RTSS_HDR_SIZE + i * hw._RTSS_APP_SIZE, bytes(e))
+    return v
+
+
+def test_hw1_rtss_prefers_foreground_process():
+    # pid 10 = game (60 fps), pid 20 = browser (more recent, 30 fps)
+    v = _rtss_view([(10, 9000, 10000, 60), (20, 9000, 10100, 30)])
+    assert hw._parse_rtss(v.addr, v.size, 10200, fg_pid=10) == pytest.approx(60 * 1000 / 1000)
+    assert hw._parse_rtss(v.addr, v.size, 10200, fg_pid=20) == pytest.approx(30 * 1000 / 1100)
+
+
+def test_hw1_rtss_falls_back_to_most_recent_without_foreground_match():
+    v = _rtss_view([(10, 9000, 10000, 60), (20, 9000, 10100, 30)])
+    assert hw._parse_rtss(v.addr, v.size, 10200, fg_pid=999) == pytest.approx(30 * 1000 / 1100)
+    assert hw._parse_rtss(v.addr, v.size, 10200, fg_pid=0) == pytest.approx(30 * 1000 / 1100)
+
+
+# ── HW-8: tick wraparound ────────────────────────────────────────────────────
+
+def test_hw8_rtss_fps_survives_tick_count_wrap():
+    t0, t1 = 0xFFFFFF00, 0x000000F0           # window straddles the 32-bit wrap
+    v = _rtss_view([(10, t0, t1, 60)])
+    dt = (t1 - t0) & 0xFFFFFFFF               # 496 ms
+    assert hw._parse_rtss(v.addr, v.size, 0x100, fg_pid=10) == pytest.approx(60 * 1000 / dt)
+
+
+# ── HW-2: stop() before run() ────────────────────────────────────────────────
+
+def test_hw2_stop_before_run_is_not_lost(monkeypatch):
+    monkeypatch.setattr(hw, "get_data", lambda sensors: ({}, {}, "N/A"))
+    w = hw.HardwareWorker([], interval_ms=100)
+    w.stop()                                   # arrives before run() begins
+    t = threading.Thread(target=w.run, daemon=True)
+    t.start()
+    t.join(1.5)
+    alive = t.is_alive()
+    w.stop()                                   # release a thread the bug would leave spinning
+    t.join(1.0)
+    assert not alive
+
+
+# ── HW-3: reads bounded by the mapped view ───────────────────────────────────
+
+def _record_memmove(monkeypatch, view):
+    calls = []
+    real = ctypes.memmove
+
+    def spy(dst, src, n):
+        if isinstance(src, int):
+            calls.append((src - view.addr, n))
+        return real(dst, src, n)
+    monkeypatch.setattr(hw.ctypes, "memmove", spy)
+    return calls
+
+
+def test_hw3_v1_entries_do_not_read_past_the_view(monkeypatch):
+    v = _mahm_view([("gpu1 usage", 11.0), ("cpu usage", 22.0)], entry_size=1312)
+    calls = _record_memmove(monkeypatch, v)
+    out = hw._parse_mahm(v.addr, v.size)
+    assert out["gpu1 usage"][0] == pytest.approx(11.0)
+    assert out["cpu usage"][0] == pytest.approx(22.0)
+    assert calls and max(off + n for off, n in calls) <= v.size
+
+
+def test_hw3_entry_count_larger_than_the_view_is_clamped(monkeypatch):
+    v = _mahm_view([("gpu1 usage", 11.0), ("cpu usage", 22.0)], claimed_num=50)
+    calls = _record_memmove(monkeypatch, v)
+    out = hw._parse_mahm(v.addr, v.size)
+    assert set(out) == {"gpu1 usage", "cpu usage"}
+    assert max(off + n for off, n in calls) <= v.size
+
+
+def test_hw3_rtss_array_larger_than_the_view_is_clamped(monkeypatch):
+    v = _rtss_view([(10, 9000, 10000, 60)])
+    hdr = hw._RtssHdr(dwSignature=hw.RTSS_SIG, dwVersion=0x00020005,
+                      dwAppEntrySize=hw._RTSS_APP_SIZE, dwAppArrOffset=hw._RTSS_HDR_SIZE,
+                      dwAppArrSize=200)
+    v.put(0, bytes(hdr))
+    calls = _record_memmove(monkeypatch, v)
+    assert hw._parse_rtss(v.addr, v.size, 10100, fg_pid=10) == pytest.approx(60.0)
+    assert max(off + n for off, n in calls) <= v.size
+
+
+# ── HW-4: FPS never binds a 1% / 0.1% low sensor ─────────────────────────────
+
+def test_hw4_fps_does_not_bind_one_percent_low():
+    names = SENSOR_CATALOG["fps"].mahm_names
+    assert hw._pick_sensor({"framerate 1% low": (40.0, None)}, names) == (None, None)
+    assert hw._pick_sensor({"framerate 0.1% low": (30.0, None)}, names) == (None, None)
+    assert hw._pick_sensor({"framerate avg": (70.0, None)}, names) == (None, None)
+
+
+def test_hw4_fps_1pct_sensor_still_binds_its_own_low_key():
+    names = SENSOR_CATALOG["fps_1pct"].mahm_names
+    assert hw._pick_sensor({"framerate 1% low": (40.0, None)}, names)[0] == pytest.approx(40.0)
+
+
+def test_hw4_fps_falls_through_to_rtss_when_only_low_is_exposed(monkeypatch):
+    monkeypatch.setattr(hw, "read_mahm", lambda: {"framerate 1% low": (40.0, None)})
+    monkeypatch.setattr(hw, "read_rtss_fps", lambda: 144.0)
+    data, _m, _s = hw.get_data([SENSOR_CATALOG["fps"]])
+    assert data["fps"] == pytest.approx(144.0)
+
+
+# ── HW-5: ping failures are logged on state change only; target configurable ─
+
+@pytest.fixture
+def ping_state(monkeypatch):
+    monkeypatch.setattr(hw, "_ping_target", hw.DEFAULT_PING_TARGET)
+    monkeypatch.setattr(hw, "_ping_ok", None)
+    monkeypatch.setattr(hw, "_ping_cache", None)
+    monkeypatch.setattr(hw, "_ping_thread", None)
+
+
+def test_hw5_failure_logged_once_then_recovery_logged(ping_state, monkeypatch, caplog):
+    def fail(*_a, **_k):
+        raise OSError("blocked")
+    monkeypatch.setattr(hw.socket, "create_connection", fail)
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(hw._log, "propagate", True)
+    for _ in range(3):
+        hw._ping_worker("1.1.1.1", 53, 0.1)
+    fails = [r for r in caplog.records if r.levelno == logging.WARNING and "Ping probe" in r.getMessage()]
+    assert len(fails) == 1 and hw._ping_cache is None
+
+    class _Ok:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    monkeypatch.setattr(hw.socket, "create_connection", lambda *a, **k: _Ok())
+    hw._ping_worker("1.1.1.1", 53, 0.1)
+    assert hw._ping_cache is not None
+    assert any("recovered" in r.getMessage() for r in caplog.records)
+
+
+def test_hw5_set_ping_target_is_used_by_the_probe(ping_state, monkeypatch):
+    seen = []
+
+    class _Ok:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    monkeypatch.setattr(hw.socket, "create_connection",
+                        lambda addr, timeout=None: seen.append(addr) or _Ok())
+    hw.set_ping_target("example.org:443")
+    hw.get_ping_ms()
+    for _ in range(100):
+        if seen:
+            break
+        time.sleep(0.02)
+    assert seen == [("example.org", 443)]
+
+
+def test_hw5_invalid_ping_target_keeps_default(ping_state):
+    hw.set_ping_target("garbage")
+    assert hw._ping_target == hw.DEFAULT_PING_TARGET
