@@ -343,7 +343,7 @@ class InstallerDownloader(QObject):
             dest    = os.path.join(tmp_dir, name)
             _log.info("Downloading update from %s → %s", self._url, dest)
 
-            if not self._download(dest):
+            if not self._download(dest) or self._cancel:   # Cancel after the last chunk counts
                 _log.info("Update download cancelled by the user.")
                 self.cancelled.emit()
                 return
@@ -902,7 +902,7 @@ def _start_install(path: str, prog, quit_fn, parent=None) -> bool:
         return True
 
     _log.error("ShellExecuteExW failed (err=%d) — installer not launched", err)
-    prog.close()
+    prog.done(0)
     shutil.rmtree(os.path.dirname(path), ignore_errors=True)
     if err == ERROR_CANCELLED:
         body = ("The update was not installed because administrator permission "
@@ -959,11 +959,11 @@ def prompt_and_install(tag: str, download_url: str, notes: str = "", parent=None
 
     def _on_cancelled():
         _active.clear()
-        prog.close()
+        prog.done(0)
 
     def _on_error(msg_text: str):
         _active.clear()
-        prog.close()
+        prog.done(0)
         _show_download_error(msg_text, parent)
 
     downloader.progress.connect(_on_progress)

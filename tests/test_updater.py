@@ -242,7 +242,7 @@ def test_failed_or_declined_launch_keeps_the_app_running(monkeypatch, tmp_path, 
 
     assert install_spy.scheduled == []            # no quit scheduled
     quit_fn.assert_not_called()
-    prog.close.assert_called_once()
+    prog.done.assert_called_once_with(0)
     assert len(install_spy.shown) == 1            # the user is told
     assert ("administrator" in install_spy.shown[0][1]) == (err == 1223)
     assert not os.path.exists(exe)                # verified-but-unused installer removed
@@ -582,3 +582,90 @@ def test_update_checker_has_no_ignored_parent_argument():
     # is parentless and callers keep their own reference.
     assert "parent" not in inspect.signature(UpdateChecker.__init__).parameters
     assert UpdateChecker("o", "r").parent() is None
+
+
+# -- R-UP-1 / R-UP-3 -----------------------------------------------------------
+
+def _real_progress(qtbot):
+    prog = updater.DownloadProgressDialog()
+    qtbot.addWidget(prog)
+    prog.show()
+    assert prog.isVisible()
+    return prog
+
+
+def test_rup1_failed_launch_hides_the_real_progress_dialog(qtbot, monkeypatch, tmp_path, install_spy):
+    monkeypatch.setattr(updater, "_launch_installer", lambda path: 5)
+    prog = _real_progress(qtbot)
+    assert updater._start_install(_installer_in(tmp_path), prog, MagicMock()) is False
+    assert not prog.isVisible()
+
+
+@pytest.mark.parametrize("signal_name", ["error", "cancelled"])
+def test_rup1_cancel_and_error_hide_the_progress_dialog(qtbot, monkeypatch, signal_name):
+    from PyQt6.QtCore import QObject, pyqtSignal
+
+    holder = {}
+
+    class FakeDl(QObject):
+        progress = pyqtSignal(int)
+        finished = pyqtSignal(str)
+        error = pyqtSignal(str)
+        cancelled = pyqtSignal()
+
+        def __init__(self, url):
+            super().__init__()
+            holder["dl"] = self
+
+        def cancel(self): pass
+        def start(self): pass
+
+    class FakeUpdate:
+        UPDATE, SKIP = 1, 2
+        def __init__(self, *a, **k): pass
+        def adjustSize(self): pass
+        def _center_on_screen(self): pass
+        def exec(self): pass
+        def choice(self): return 1
+
+    shown = []
+    monkeypatch.setattr(updater, "UpdateDialog", FakeUpdate)
+    monkeypatch.setattr(updater, "InstallerDownloader", FakeDl)
+    monkeypatch.setattr(updater, "_show_download_error", lambda raw, parent=None: shown.append(raw))
+    created = []
+    real_cls = updater.DownloadProgressDialog
+
+    def make_prog(*a, **k):
+        p = real_cls(*a, **k)
+        qtbot.addWidget(p)
+        created.append(p)
+        return p
+    monkeypatch.setattr(updater, "DownloadProgressDialog", make_prog)
+
+    updater.prompt_and_install("v9.9.9", "https://x/Istari_Setup.exe")
+    prog = created[0]
+    assert prog.isVisible()
+    if signal_name == "error":
+        holder["dl"].error.emit("boom")
+    else:
+        prog.reject()                     # Esc asks to cancel; it must not hide by itself
+        holder["dl"].cancelled.emit()
+    assert not prog.isVisible()
+
+
+def test_rup3_cancel_after_the_last_chunk_never_runs_the_installer(server, tmp_path):
+    srv = server("ok")
+    d, errors, finished = _stub_downloader(srv.url)
+    real = d._download
+
+    def download_then_cancel(dest):
+        ok = real(dest)
+        d.cancel()                         # Cancel lands after the final chunk
+        return ok
+    d._download = download_then_cancel
+
+    d._run()
+
+    assert finished == [] and errors == []
+    d.cancelled.emit.assert_called_once()
+    _assert_no_update_dirs(tmp_path)
