@@ -365,8 +365,9 @@ def test_cfg1_unreadable_file_is_kept_and_not_overwritten(tmp_settings, monkeypa
     assert cfg.save_cfg(result) is False                # and not overwritten with defaults
     monkeypatch.setattr("builtins.open", real_open)
     assert json.loads(tmp_settings.read_text())["scale"] == 150
-    # once the file is readable again a save goes through
-    assert cfg.save_cfg(result) is True
+    # R-CFG-1: still blocked once the file is readable again (session-sticky)
+    assert cfg.save_cfg(result) is False
+    assert json.loads(tmp_settings.read_text())["scale"] == 150
 
 
 # ── CFG-2: BOM + per-field sanitizing ─────────────────────────────────────────
@@ -526,3 +527,51 @@ def test_ping_target_default_and_validation(tmp_settings):
     tmp_settings.write_text(json.dumps({"ping_target": "nonsense", "scale": 150}))
     r = cfg.load_cfg()
     assert r["ping_target"] == "1.1.1.1:53" and r["scale"] == 150
+
+
+# -- R-CFG-1: an unreadable file stays protected for the whole session ---------
+
+def _lock(monkeypatch, path):
+    real_open = open
+
+    def locked(p, *a, **k):
+        if str(p) == str(path):
+            raise PermissionError("sharing violation")
+        return real_open(p, *a, **k)
+    monkeypatch.setattr("builtins.open", locked)
+    return real_open
+
+
+def test_rcfg1_unreadable_stays_blocked_after_unlock_and_reload(tmp_settings, monkeypatch):
+    tmp_settings.write_text(json.dumps({"scale": 150}))
+    real_open = _lock(monkeypatch, tmp_settings)
+    defaults = cfg.load_cfg()
+    monkeypatch.setattr("builtins.open", real_open)       # file is readable again
+
+    cfg.load_cfg()                                         # e.g. the updater thread
+    assert cfg.save_cfg(defaults) is False
+    assert json.loads(tmp_settings.read_text())["scale"] == 150
+
+
+def test_rcfg1_newer_schema_block_survives_a_concurrent_load(tmp_settings, monkeypatch):
+    tmp_settings.write_text(json.dumps({"scale": 150, "schema": cfg.SCHEMA_VERSION + 1}))
+    loaded = cfg.load_cfg()
+    seen = []
+    real_migrate = cfg._migrate_legacy_settings
+
+    def racing_migrate():
+        seen.append(cfg.save_cfg(loaded))     # a save lands mid-way through another load
+        return real_migrate()
+    monkeypatch.setattr(cfg, "_migrate_legacy_settings", racing_migrate)
+    cfg.load_cfg()
+    assert seen == [False]
+    assert json.loads(tmp_settings.read_text())["scale"] == 150
+
+
+# -- R-CFG-2: absurdly nested JSON is quarantined, not a crash -----------------
+
+def test_rcfg2_deeply_nested_json_is_quarantined(tmp_settings):
+    tmp_settings.write_text("[" * 200_000)
+    r = cfg.load_cfg()
+    assert r["scale"] == 100
+    assert list(tmp_settings.parent.glob("settings.json.corrupt_*"))

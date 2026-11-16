@@ -40,3 +40,10 @@ def _no_real_registry(monkeypatch):
         return real_open(key, sub_key, reserved, access)
 
     monkeypatch.setattr(winreg, "OpenKey", guarded_open)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_cfg_save_block(monkeypatch):
+    """`cfg._save_block` is session-sticky; do not let it leak between tests."""
+    import cfg
+    monkeypatch.setattr(cfg, "_save_block", None)

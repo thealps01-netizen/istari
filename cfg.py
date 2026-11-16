@@ -336,6 +336,7 @@ def _migrate_legacy_settings() -> bool:
 # Why save_cfg must not write: None, "unreadable" (the file exists but could not
 # be read — the in-memory settings are only defaults) or "newer" (written by a
 # newer build). Either way the file on disk holds settings we must not clobber.
+# Both are sticky for the rest of the session.
 _save_block: "str | None" = None
 
 
@@ -368,8 +369,9 @@ def is_first_run() -> bool:
 
 
 def load_cfg():
+    # _save_block is never cleared here: a load racing with a save (the updater
+    # thread reloads ~30 s after start) must not lift a block set earlier.
     global _save_block
-    _save_block = None
     _migrate_legacy_settings()
     try:
         # utf-8-sig: Notepad writes a BOM, which plain utf-8 json.load rejects.
@@ -387,8 +389,8 @@ def load_cfg():
                    "session; the file is left untouched.", type(e).__name__, e)
         _save_block = "unreadable"
         return default_cfg()
-    except ValueError as e:   # JSONDecodeError, UnicodeDecodeError, non-object root
-        _log.warning("Settings file corrupted (%s), using defaults.", e)
+    except (ValueError, RecursionError) as e:   # bad JSON/UTF-8, non-object root, absurd nesting
+        _log.warning("Settings file corrupted (%s: %s), using defaults.", type(e).__name__, e)
         _backup_corrupt_settings()
         return default_cfg()
 
@@ -452,21 +454,12 @@ def save_cfg(cfg) -> bool:
     line) on any failure or when saving would clobber a file we could not read
     or that a newer build wrote.
     """
-    global _save_block
     if _save_block == "unreadable":
-        # The load failed, so cfg may be plain defaults. Overwrite only once the
-        # file is readable again — otherwise the user's real settings are lost.
-        try:
-            with open(SETTINGS_FILE, "rb") as f:
-                f.read(1)
-        except FileNotFoundError:
-            _save_block = None
-        except OSError as e:
-            _log.error("Settings not saved: %s is still unreadable (%s: %s).",
-                       SETTINGS_FILE, type(e).__name__, e)
-            return False
-        else:
-            _save_block = None
+        # The load failed, so cfg may be plain defaults. Sticky for the session:
+        # even if the file is readable now, the user's real settings were never loaded.
+        _log.error("Settings not saved: %s could not be read at startup; restart "
+                   "Istari to load and edit it.", SETTINGS_FILE)
+        return False
     if _save_block == "newer":
         _log.error("Settings not saved: %s was written by a newer build.", SETTINGS_FILE)
         return False
