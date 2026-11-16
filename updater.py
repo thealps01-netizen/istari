@@ -237,7 +237,7 @@ class UpdateChecker(QObject):
 
         # Import here to avoid circular imports at module load time
         from cfg import load_cfg
-        skipped = load_cfg().get("skipped_version", "")
+        skipped = (load_cfg(read_only=True) or {}).get("skipped_version", "")
 
         release, reason = _fetch_release(self._owner, self._repo)
         if release is None:
@@ -1012,7 +1012,10 @@ def prompt_and_install(tag: str, download_url: str, notes: str = "", parent=None
     choice = dlg.choice()
 
     if choice == UpdateDialog.SKIP:
-        cfg = load_cfg()
+        cfg = load_cfg(read_only=True)
+        if cfg is None:
+            _log.error("Version %s not marked as skipped: settings could not be read.", tag)
+            return
         cfg["skipped_version"] = tag
         save_cfg(cfg)
         _log.info("Version %s marked as skipped.", tag)
@@ -1038,6 +1041,11 @@ def prompt_and_install(tag: str, download_url: str, notes: str = "", parent=None
 
     def _on_finished(path: str):
         _active.clear()
+        if downloader._cancel:   # Cancel pressed while the checksum was being verified
+            _log.info("Update cancelled during verification; installer not launched.")
+            prog.done(0)
+            shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+            return
         _start_install(path, prog, quit_fn, parent)
 
     def _on_cancelled():

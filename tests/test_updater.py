@@ -398,7 +398,7 @@ def test_launch_installer_reports_the_win32_error_when_shellexecute_fails(monkey
 
 def _run_checker(qtbot, monkeypatch, fetch, cfg=None, manual=False):
     import cfg as cfg_mod
-    monkeypatch.setattr(cfg_mod, "load_cfg", lambda: dict(cfg or {}))
+    monkeypatch.setattr(cfg_mod, "load_cfg", lambda **k: dict(cfg or {}))
     monkeypatch.setattr(updater, "_fetch_release", fetch)
     c = UpdateChecker("o", "r", manual=manual)
     got = []
@@ -796,3 +796,94 @@ def test_rup3_cancel_after_the_last_chunk_never_runs_the_installer(server, tmp_p
     assert finished == [] and errors == []
     d.cancelled.emit.assert_called_once()
     _assert_no_update_dirs(tmp_path)
+
+
+# ── R2-1: Cancel during SHA256 verification must not launch the installer ─────
+
+def test_r2_1_cancel_during_verification_never_launches_the_installer(qtbot, monkeypatch, tmp_path):
+    from PyQt6.QtCore import QObject, pyqtSignal
+    holder = {}
+
+    class FakeDl(QObject):
+        progress = pyqtSignal(int)
+        finished = pyqtSignal(str)
+        error = pyqtSignal(str)
+        cancelled = pyqtSignal()
+        _cancel = False
+
+        def __init__(self, url):
+            super().__init__()
+            holder["dl"] = self
+
+        def cancel(self): self._cancel = True
+        def start(self): pass
+
+    class FakeUpdate:
+        UPDATE, SKIP = 1, 2
+        def __init__(self, *a, **k): pass
+        def adjustSize(self): pass
+        def _center_on_screen(self): pass
+        def exec(self): pass
+        def choice(self): return 1
+
+    started = []
+    monkeypatch.setattr(updater, "UpdateDialog", FakeUpdate)
+    monkeypatch.setattr(updater, "InstallerDownloader", FakeDl)
+    monkeypatch.setattr(updater, "_start_install", lambda *a, **k: started.append(a))
+    created = []
+    real_cls = updater.DownloadProgressDialog
+
+    def make_prog(*a, **k):
+        p = real_cls(*a, **k)
+        qtbot.addWidget(p)
+        created.append(p)
+        return p
+    monkeypatch.setattr(updater, "DownloadProgressDialog", make_prog)
+
+    updater.prompt_and_install("v9.9.9", "https://x/Istari_Setup.exe")
+    installer = _installer_in(tmp_path)
+    holder["dl"].cancel()                         # Cancel pressed while the hash runs
+    holder["dl"].finished.emit(installer)
+
+    assert started == []
+    assert not created[0].isVisible()
+    assert not os.path.exists(os.path.dirname(installer))
+    assert updater._active == []
+
+
+# ── R2-2: update checker / Skip use read-only loads ──────────────────────────
+
+def test_r2_2_checker_loads_settings_read_only(qtbot, monkeypatch):
+    import cfg as cfg_mod
+    seen = []
+    monkeypatch.setattr(cfg_mod, "load_cfg", lambda **k: seen.append(k) or {})
+    monkeypatch.setattr(updater, "_fetch_release", lambda o, r: (None, "network"))
+    c = UpdateChecker("o", "r", manual=False)
+    c.check_failed.connect(lambda m: None)
+    c.start()
+    qtbot.waitUntil(lambda: not c._thread.isRunning(), timeout=5000)
+    assert seen == [{"read_only": True}]
+
+
+@pytest.mark.parametrize("loaded", [None, {"scale": 100}])
+def test_r2_2_skip_never_saves_defaults_when_the_read_failed(monkeypatch, loaded):
+    import cfg as cfg_mod
+    saved = []
+    seen = []
+    monkeypatch.setattr(cfg_mod, "load_cfg", lambda **k: seen.append(k) or loaded)
+    monkeypatch.setattr(cfg_mod, "save_cfg", lambda c: saved.append(dict(c)) or True)
+
+    class FakeUpdate:
+        UPDATE, SKIP = 1, 2
+        def __init__(self, *a, **k): pass
+        def adjustSize(self): pass
+        def _center_on_screen(self): pass
+        def exec(self): pass
+        def choice(self): return 2
+    monkeypatch.setattr(updater, "UpdateDialog", FakeUpdate)
+    updater.prompt_and_install("v9.9.9", "https://x/Istari_Setup.exe")
+    assert seen == [{"read_only": True}]
+    if loaded is None:
+        assert saved == []
+    else:
+        assert saved[0]["skipped_version"] == "v9.9.9"

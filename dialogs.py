@@ -14,7 +14,7 @@ from themes import is_high_contrast, THEMES, make_settings_style
 from cfg import (
     SENSOR_CATALOG, DEFAULT_CFG,
     save_cfg, default_color,
-    is_startup_enabled, set_startup,
+    is_startup_enabled, set_startup, startup_value, restore_startup_value,
 )
 from logger import LOG_FILE, get_logger
 _log = get_logger("istari.dialogs")
@@ -727,6 +727,7 @@ class SettingsDialog(QDialog):
         self._show_error("")
         want_startup = self.chk_startup.isChecked()
         prev_startup = is_startup_enabled()
+        prev_startup_value = startup_value()   # exact string, restored if the save fails
         if want_startup != prev_startup and not set_startup(want_startup):
             # Windows refused the change; show what is actually registered.
             self.chk_startup.setChecked(is_startup_enabled())
@@ -751,7 +752,7 @@ class SettingsDialog(QDialog):
         if save_cfg(self.cfg) is False:
             self.cfg.clear()
             self.cfg.update(before)          # the live settings must not claim a save
-            if want_startup != prev_startup and not set_startup(prev_startup):
+            if want_startup != prev_startup and not restore_startup_value(prev_startup_value):
                 _log.error("Could not restore the Windows startup entry after a failed save.")
             self.chk_startup.setChecked(is_startup_enabled())
             self._show_error(f"Could not save settings, see the log at {LOG_FILE}.")

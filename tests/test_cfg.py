@@ -575,3 +575,51 @@ def test_rcfg2_deeply_nested_json_is_quarantined(tmp_settings):
     r = cfg.load_cfg()
     assert r["scale"] == 100
     assert list(tmp_settings.parent.glob("settings.json.corrupt_*"))
+
+
+# ── R2-2: only the startup load may set the sticky unreadable block ───────────
+
+def test_r2_2_read_only_load_never_blocks_saves(tmp_settings, monkeypatch):
+    tmp_settings.write_text(json.dumps({"scale": 150}))
+    live = cfg.load_cfg()                                  # good startup load
+    real_open = _lock(monkeypatch, tmp_settings)
+    assert cfg.load_cfg(read_only=True) is None            # transient lock: reported, not defaults
+    monkeypatch.setattr("builtins.open", real_open)
+    assert cfg.save_cfg(live) is True                      # the live settings can still be saved
+
+
+def test_r2_2_read_only_load_returns_the_settings(tmp_settings):
+    tmp_settings.write_text(json.dumps({"scale": 150, "skipped_version": "v9"}))
+    got = cfg.load_cfg(read_only=True)
+    assert got["scale"] == 150 and got["skipped_version"] == "v9"
+
+
+def test_r2_2_read_only_load_keeps_the_newer_schema_block(tmp_settings):
+    tmp_settings.write_text(json.dumps({"scale": 150, "schema": cfg.SCHEMA_VERSION + 1}))
+    got = cfg.load_cfg(read_only=True)
+    assert got["scale"] == 150
+    assert cfg.save_cfg(got) is False
+    assert json.loads(tmp_settings.read_text())["scale"] == 150
+
+
+# ── R2-3: restore the exact previous startup value ────────────────────────────
+
+def test_r2_3_restore_startup_value_writes_the_exact_string(monkeypatch):
+    written = []
+    monkeypatch.setattr(cfg.winreg, "OpenKey", lambda *a, **k: _FakeKey())
+    monkeypatch.setattr(cfg.winreg, "SetValueEx",
+                        lambda key, name, reserved, kind, value: written.append((name, value)))
+    monkeypatch.setattr(cfg.winreg, "CloseKey", lambda key: None)
+    monkeypatch.setattr(cfg, "_query_startup_value", lambda name: '"C:/old/Istari.exe" --x')
+    assert cfg.restore_startup_value('"C:/old/Istari.exe" --x') is True
+    assert written == [("Istari", '"C:/old/Istari.exe" --x')]
+
+
+def test_r2_3_restore_startup_value_none_removes_the_entry(monkeypatch):
+    deleted = []
+    monkeypatch.setattr(cfg.winreg, "OpenKey", lambda *a, **k: _FakeKey())
+    monkeypatch.setattr(cfg.winreg, "DeleteValue", lambda key, name: deleted.append(name))
+    monkeypatch.setattr(cfg.winreg, "CloseKey", lambda key: None)
+    monkeypatch.setattr(cfg, "_query_startup_value", lambda name: None)
+    assert cfg.restore_startup_value(None) is True
+    assert deleted == ["Istari"]

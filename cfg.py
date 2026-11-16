@@ -96,6 +96,40 @@ def set_startup(enabled) -> bool:
     return is_startup_enabled() if enabled else not is_startup_enabled()
 
 
+def startup_value():
+    """The raw autostart command currently registered for Istari, or None."""
+    return _query_startup_value(_APP_NAME)
+
+
+def restore_startup_value(prev) -> bool:
+    """Put the autostart entry back to exactly `prev` (None = no entry).
+
+    Unlike set_startup(True) this never substitutes the current command, so a
+    rolled-back change leaves the registry as it was. True only when verified.
+    """
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, _STARTUP_KEY, 0, winreg.KEY_SET_VALUE
+        )
+    except OSError as e:
+        _log.warning("Could not open the startup registry key (%s: %s)", type(e).__name__, e)
+        return False
+    try:
+        if prev is None:
+            try:
+                winreg.DeleteValue(key, _APP_NAME)
+            except OSError:
+                pass   # already absent
+        else:
+            winreg.SetValueEx(key, _APP_NAME, 0, winreg.REG_SZ, prev)
+    except OSError as e:
+        _log.warning("Could not restore the startup entry (%s: %s)", type(e).__name__, e)
+        return False
+    finally:
+        winreg.CloseKey(key)
+    return startup_value() == prev
+
+
 def purge_dead_legacy_startup() -> bool:
     """Remove the pre-rename "Palantir" autostart value when its target is gone.
 
@@ -368,7 +402,14 @@ def is_first_run() -> bool:
     return not os.path.exists(SETTINGS_FILE)
 
 
-def load_cfg():
+def load_cfg(read_only=False):
+    """Load the settings.
+
+    Only the startup load (the result becomes the live cfg) may set the sticky
+    "unreadable" save block. `read_only=True` is for later loads (update checker,
+    Skip): it never changes that block, and returns None when the file could not
+    be read, so callers cannot mistake defaults for the user's settings.
+    """
     # _save_block is never cleared here: a load racing with a save (the updater
     # thread reloads ~30 s after start) must not lift a block set earlier.
     global _save_block
@@ -387,6 +428,8 @@ def load_cfg():
         # may be perfectly good, so it stays where it is and is not overwritten.
         _log.error("Could not read settings (%s: %s) — using defaults for this "
                    "session; the file is left untouched.", type(e).__name__, e)
+        if read_only:
+            return None
         _save_block = "unreadable"
         return default_cfg()
     except (ValueError, RecursionError) as e:   # bad JSON/UTF-8, non-object root, absurd nesting
@@ -430,6 +473,8 @@ def load_cfg():
         # A bug, not bad data: keep the file as it is rather than renaming it.
         _log.exception("Failed to apply settings (%s: %s), using defaults.",
                        type(e).__name__, e)
+        if read_only:
+            return None
         _save_block = _save_block or "unreadable"
         return default_cfg()
 

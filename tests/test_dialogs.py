@@ -405,6 +405,13 @@ def test_rui1_failed_save_restores_the_startup_entry(dialogs, cfg, monkeypatch):
         return True
     monkeypatch.setattr(dialogs, "set_startup", set_startup)
     monkeypatch.setattr(dialogs, "is_startup_enabled", lambda: state["on"])
+    monkeypatch.setattr(dialogs, "startup_value", lambda: "x" if state["on"] else None)
+
+    def restore(prev):
+        calls.append(prev is not None)
+        state["on"] = prev is not None
+        return True
+    monkeypatch.setattr(dialogs, "restore_startup_value", restore)
     monkeypatch.setattr(dialogs, "save_cfg", lambda c: False)
     dlg = dialogs.SettingsDialog(cfg)
     dlg.chk_startup.setChecked(True)
@@ -413,3 +420,18 @@ def test_rui1_failed_save_restores_the_startup_entry(dialogs, cfg, monkeypatch):
     assert state["on"] is False
     assert dlg.chk_startup.isChecked() is False
     assert dlg._error_lbl.text()
+
+
+def test_r2_3_failed_save_restores_the_original_startup_string(dialogs, cfg, monkeypatch):
+    old = '"C:/old/Istari.exe" --flag'
+    restored = []
+    monkeypatch.setattr(dialogs, "set_startup", lambda enabled: True)
+    monkeypatch.setattr(dialogs, "is_startup_enabled", lambda: True)
+    monkeypatch.setattr(dialogs, "startup_value", lambda: old, raising=False)
+    monkeypatch.setattr(dialogs, "restore_startup_value",
+                        lambda v: restored.append(v) or True, raising=False)
+    monkeypatch.setattr(dialogs, "save_cfg", lambda c: False)
+    dlg = dialogs.SettingsDialog(cfg)
+    dlg.chk_startup.setChecked(False)
+    dlg._apply()
+    assert restored == [old]
