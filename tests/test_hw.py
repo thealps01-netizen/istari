@@ -502,3 +502,18 @@ def test_hw5_set_ping_target_is_used_by_the_probe(ping_state, monkeypatch):
 def test_hw5_invalid_ping_target_keeps_default(ping_state):
     hw.set_ping_target("garbage")
     assert hw._ping_target == hw.DEFAULT_PING_TARGET
+
+
+# -- R-HW-1: MAHM v1.x has a 24-byte header ------------------------------------
+
+def test_rhw1_v1_header_of_24_bytes_is_accepted():
+    n, esz = 2, 1312
+    v = _View(24 + n * esz)
+    hdr = hw._Hdr(sig=hw.MAHM_SIG, ver=0x10000, headerSize=24, num=n, entrySize=esz)
+    v.put(0, bytes(hdr)[:24])
+    for i, (name, val) in enumerate([("gpu1 usage", 11.0), ("cpu usage", 22.0)]):
+        e = hw._Entry(srcName=name.encode(), data=val, max_limit=100.0)
+        v.put(24 + i * esz, bytes(e)[:esz])
+    out = hw._parse_mahm(v.addr, v.size)
+    assert out["gpu1 usage"][0] == pytest.approx(11.0)
+    assert out["cpu usage"][0] == pytest.approx(22.0)

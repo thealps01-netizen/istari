@@ -56,6 +56,7 @@ class _Entry(ctypes.LittleEndianStructure):
 
 # ── Pre-computed sizes, kernel32 setup (once at import) ───────────────────────
 _HDR_SIZE   = ctypes.sizeof(_Hdr)
+_MIN_HDR_SIZE = 24   # MAHM v1.x header: signature .. time (no GPU fields)
 _ENTRY_SIZE = ctypes.sizeof(_Entry)
 
 _mahm_sensor_count: int = 0   # tracks last reported count to avoid log spam
@@ -159,7 +160,7 @@ def _parse_mahm(pv: int, size: int) -> dict:
     num    = hdr.num
     hdr_sz = hdr.headerSize or _HDR_SIZE
     sz     = hdr.entrySize  or _ENTRY_SIZE
-    if num > 512 or sz < _MIN_ENTRY_SIZE or sz > 8192 or hdr_sz < _HDR_SIZE or hdr_sz > size:
+    if num > 512 or sz < _MIN_ENTRY_SIZE or sz > 8192 or hdr_sz < _MIN_HDR_SIZE or hdr_sz > size:
         _warn_once("mahm-header", "MAHM header sanity check failed (num=%d, hdr=%d, sz=%d, view=%d)",
                    num, hdr_sz, sz, size)
         return {}
