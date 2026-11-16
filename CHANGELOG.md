@@ -6,7 +6,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
-## [Unreleased]
+## [1.0.25] — 2026-11-17
 
 ### Fixed
 - **No administrator rights after an update.** After an automatic update Istari now restarts
@@ -32,9 +32,8 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   statistics. Sensor reads stay inside the mapped memory, so a malformed block cannot crash the app.
 - **Crashes and logs.** The crash dialog appears once, on the UI thread, and crash files no longer
   overwrite each other. A locked or unwritable log folder no longer stops the app or silences logging.
-- **Installer and release.** Auto-updates restart Istari without administrator rights, the
-  uninstaller removes the startup entry, and release builds are tested, pinned and checked against
-  the tag before publishing.
+- **Installer and release.** The uninstaller removes the startup entry, and release builds are
+  tested, pinned and checked against the tag before publishing.
 
 ### Changed
 - The test suite runs against a temporary data folder and fails any test that writes the real
