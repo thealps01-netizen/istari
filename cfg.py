@@ -434,6 +434,8 @@ def load_cfg(read_only=False):
         return default_cfg()
     except (ValueError, RecursionError) as e:   # bad JSON/UTF-8, non-object root, absurd nesting
         _log.warning("Settings file corrupted (%s: %s), using defaults.", type(e).__name__, e)
+        if read_only:
+            return None          # a read-only load never renames or writes anything
         _backup_corrupt_settings()
         return default_cfg()
 

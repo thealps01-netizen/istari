@@ -623,3 +623,14 @@ def test_r2_3_restore_startup_value_none_removes_the_entry(monkeypatch):
     monkeypatch.setattr(cfg, "_query_startup_value", lambda name: None)
     assert cfg.restore_startup_value(None) is True
     assert deleted == ["Istari"]
+
+
+# ── R3-2: a read-only load never renames or writes anything ───────────────────
+
+@pytest.mark.parametrize("content", [b"{not json", b"[1, 2]", b"\xff\xfe\x00bad", b"[" * 100000],
+                         ids=["bad-json", "non-object", "bad-utf8", "deep-nesting"])
+def test_r3_2_read_only_load_leaves_a_corrupt_file_alone(tmp_settings, content):
+    tmp_settings.write_bytes(content)
+    assert cfg.load_cfg(read_only=True) is None
+    assert tmp_settings.read_bytes() == content
+    assert [p.name for p in tmp_settings.parent.iterdir()] == ["settings.json"]

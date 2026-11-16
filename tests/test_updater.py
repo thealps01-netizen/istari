@@ -887,3 +887,29 @@ def test_r2_2_skip_never_saves_defaults_when_the_read_failed(monkeypatch, loaded
         assert saved == []
     else:
         assert saved[0]["skipped_version"] == "v9.9.9"
+
+
+# -- R3-1: Esc / Alt+F4 once installing must not cancel -------------------------
+
+def test_r3_1_reject_while_installing_does_not_request_cancel(qtbot):
+    prog = _real_progress(qtbot)
+    seen = []
+    prog.cancel_requested.connect(lambda: seen.append(1))
+    prog.set_installing()
+    prog.reject()
+    assert seen == []
+
+
+def test_r3_1_cancel_flag_set_during_set_installing_aborts_before_launch(monkeypatch, tmp_path, install_spy):
+    launched = []
+    monkeypatch.setattr(updater, "_launch_installer", lambda path: launched.append(path) or (None, 77))
+    flag = {"cancel": False}
+    prog = MagicMock()
+    prog.set_installing.side_effect = lambda: flag.update(cancel=True)   # Esc lands in processEvents()
+    exe = _installer_in(tmp_path)
+
+    assert updater._start_install(exe, prog, MagicMock(), cancelled=lambda: flag["cancel"]) is False
+
+    assert launched == []
+    prog.done.assert_called_once_with(0)
+    assert not os.path.exists(exe)

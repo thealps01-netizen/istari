@@ -659,6 +659,7 @@ class DownloadProgressDialog(_DraggableDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._installing = False
         self.setWindowTitle("Istari — Downloading")
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -700,7 +701,9 @@ class DownloadProgressDialog(_DraggableDialog):
         self._btn_cancel.setEnabled(False)
         self.cancel_requested.emit()
 
-    def reject(self) -> None:          # Esc = Cancel
+    def reject(self) -> None:          # Esc = Cancel (not once the installer is launching)
+        if self._installing:
+            return
         self._on_cancel()
 
     def set_progress(self, pct: int) -> None:
@@ -709,6 +712,7 @@ class DownloadProgressDialog(_DraggableDialog):
         QApplication.processEvents()
 
     def set_installing(self) -> None:
+        self._installing = True        # set before processEvents(): Esc must not cancel now
         self.setWindowTitle("Istari — Installing")
         for child in self.findChildren(QLabel):
             if child.objectName() == "title":
@@ -943,7 +947,7 @@ def _close_handle(handle) -> None:
     k32.CloseHandle(handle)
 
 
-def _start_install(path: str, prog, quit_fn, parent=None) -> bool:
+def _start_install(path: str, prog, quit_fn, parent=None, cancelled=None) -> bool:
     """Run the verified installer; quit once the elevated Setup is really running.
 
     The app keeps running while the UAC prompt is open. If the prompt is declined or
@@ -951,6 +955,11 @@ def _start_install(path: str, prog, quit_fn, parent=None) -> bool:
     with no overlay and no update. Polls on the Qt thread with zero-timeout waits.
     """
     prog.set_installing()
+    if cancelled is not None and cancelled():   # a cancel landed during set_installing()
+        _log.info("Update cancelled before launch; installer not launched.")
+        prog.done(0)
+        shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+        return False
     _log.info("Launching installer: %s", path)
     err, handle = _launch_installer(path)
 
@@ -1046,7 +1055,7 @@ def prompt_and_install(tag: str, download_url: str, notes: str = "", parent=None
             prog.done(0)
             shutil.rmtree(os.path.dirname(path), ignore_errors=True)
             return
-        _start_install(path, prog, quit_fn, parent)
+        _start_install(path, prog, quit_fn, parent, cancelled=lambda: downloader._cancel)
 
     def _on_cancelled():
         _active.clear()
