@@ -89,6 +89,8 @@ class Istari(QWidget):
         gapp.screenRemoved.connect(self._on_screens_changed)
         for scr in QApplication.screens():
             scr.availableGeometryChanged.connect(self._on_screens_changed)
+        gapp.screenAdded.connect(
+            lambda scr: scr.availableGeometryChanged.connect(self._on_screens_changed))
         gapp.aboutToQuit.connect(self._stop_worker)
 
         set_ping_target(self.cfg.get("ping_target"))
@@ -749,7 +751,12 @@ class Istari(QWidget):
 
     def _dialog_screen(self):
         """Work area of the monitor the overlay is on (dialogs open there)."""
-        scr = self.screen() or QApplication.primaryScreen()
+        scr = None
+        if not self.isVisible() and self._home_pos is not None:
+            # Tray-hidden: the window is parked off its monitor; use its home.
+            scr = QApplication.screenAt(QPoint(self._home_pos.x() + self.width() // 2,
+                                               self._home_pos.y() + self.height() // 2))
+        scr = scr or self.screen() or QApplication.primaryScreen()
         return scr.availableGeometry()
 
     # ── Settings ──────────────────────────────────────────────────────────────

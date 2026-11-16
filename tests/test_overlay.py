@@ -438,3 +438,29 @@ def test_automatic_check_failure_does_not_pop_up(make, monkeypatch):
     made[-1].check_failed.emit("offline")
     assert shown == []
     assert w._updater_running is False
+
+
+# -- R-UI-2: monitors plugged in later are watched too -------------------------
+def test_rui2_screen_added_later_gets_its_work_area_watched(make, monkeypatch):
+    import istari
+    from PyQt6.QtGui import QGuiApplication
+    calls = []
+    monkeypatch.setattr(istari.Istari, "_on_screens_changed",
+                        lambda self, *a: calls.append(self))
+    w = make([S1()])
+    real = QGuiApplication.primaryScreen()
+    QGuiApplication.instance().screenAdded.emit(real)
+    calls.clear()
+    real.availableGeometryChanged.emit(QRect(0, 0, 1, 1))
+    assert w in calls
+
+
+# -- R-UI-3: dialogs open on the home monitor of a tray-hidden overlay ---------
+def test_rui3_dialog_screen_uses_home_position_when_tray_hidden(make):
+    s1, s2 = S1(), S2()
+    w = make([s1, s2])
+    w.show()
+    w._home_pos = QPoint(2000, 50)
+    w.hide()
+    w.setGeometry(100, 1200, w.width(), w.height())     # parked below its monitor
+    assert w._dialog_screen() == s2.availableGeometry()
