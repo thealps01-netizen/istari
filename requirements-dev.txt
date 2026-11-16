@@ -7,7 +7,7 @@
 pyinstaller==6.22.3
 
 # Icon generator (tools/make_icon.py) — build time only, never imported by the app
-Pillow==12.3.0
+Pillow==13.0.0
 numpy==2.4.3
 
 # Tests
