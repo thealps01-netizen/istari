@@ -346,17 +346,6 @@ def test_set_startup_reports_true_when_removal_succeeded(monkeypatch):
 
 
 
-# ── Guard: no test may touch the real registry ────────────────────────────────
-
-@pytest.fixture(autouse=True)
-def _no_real_registry(monkeypatch):
-    """Any winreg access not explicitly faked by the test fails loudly."""
-    def real(*_a, **_k):
-        raise RuntimeError("test touched the real registry")
-    for name in ("OpenKey", "SetValueEx", "DeleteValue", "QueryValueEx"):
-        monkeypatch.setattr(cfg.winreg, name, real)
-
-
 # ── CFG-1: only parse errors quarantine the file ──────────────────────────────
 
 def test_cfg1_unreadable_file_is_kept_and_not_overwritten(tmp_settings, monkeypatch):

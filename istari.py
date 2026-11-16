@@ -18,7 +18,7 @@ crash_handler.install()
 from logger import get_logger, LOG_DIR
 _log = get_logger("istari")
 
-from hw      import get_data, HardwareWorker
+from hw      import get_data, HardwareWorker, set_ping_target
 from updater import UpdateChecker, prompt_and_install
 from themes  import is_high_contrast, THEMES, make_widget_css, build_menu_css
 from dialogs import WelcomeDialog, SettingsDialog
@@ -31,7 +31,14 @@ from cfg import (
     load_cfg, save_cfg, eff_color, default_color,
     active_sensor_defs,
     is_startup_enabled, set_startup, purge_dead_legacy_startup,
+    is_first_run as _cfg_is_first_run,
 )
+
+
+def _detect_first_run() -> bool:
+    """True when no settings exist (after the legacy migration has run)."""
+    return _cfg_is_first_run()
+
 
 
 
@@ -83,6 +90,8 @@ class Istari(QWidget):
         for scr in QApplication.screens():
             scr.availableGeometryChanged.connect(self._on_screens_changed)
         gapp.aboutToQuit.connect(self._stop_worker)
+
+        set_ping_target(self.cfg.get("ping_target"))
 
         # ── Background hardware worker (non-blocking) ──────────────────────────
         self._hw_worker = HardwareWorker(
@@ -206,7 +215,7 @@ class Istari(QWidget):
         # the only reference mid-thread destroys a running QThread.
         refs = [u for u in getattr(self, "_updater_refs", [])
                 if getattr(getattr(u, "_thread", None), "isRunning", lambda: False)()]
-        self._updater = UpdateChecker(_GITHUB_OWNER, _GITHUB_REPO, parent=self)
+        self._updater = UpdateChecker(_GITHUB_OWNER, _GITHUB_REPO, manual=manual)
         refs.append(self._updater)
         self._updater_refs = refs
         self._updater.update_available.connect(
@@ -214,9 +223,11 @@ class Istari(QWidget):
         )
         if manual:
             self._updater.no_update.connect(self._on_no_update)
-            self._updater.check_failed.connect(self._on_check_failed)
+        self._updater.check_failed.connect(
+            lambda reason: self._on_check_failed(reason, manual)
+        )
         self._updater.no_update.connect(lambda: setattr(self, "_updater_running", False))
-        self._updater.check_failed.connect(lambda: setattr(self, "_updater_running", False))
+        self._updater.check_failed.connect(lambda *_: setattr(self, "_updater_running", False))
         self._updater.update_available.connect(lambda *_: setattr(self, "_updater_running", False))
         self._updater.start()
 
@@ -231,10 +242,13 @@ class Istari(QWidget):
             3000,
         )
 
-    def _on_check_failed(self) -> None:
+    def _on_check_failed(self, reason: str = "", manual: bool = True) -> None:
+        _log.warning("Update check failed (%s): %s", "manual" if manual else "automatic", reason)
+        if not manual:
+            return   # automatic checks never pop up
         self._tray.showMessage(
             "Istari",
-            "Could not reach the update server. Check your connection.",
+            reason or "Could not reach the update server. Check your connection.",
             QSystemTrayIcon.MessageIcon.Warning,
             4000,
         )
@@ -754,6 +768,7 @@ class Istari(QWidget):
             self._apply_widget_css()
             self.setWindowOpacity(self.cfg["opacity"] / 100)
             self._hw_worker.set_interval(self.cfg["update_ms"])
+            set_ping_target(self.cfg.get("ping_target"))
             self._hw_worker.set_sensors(active_sensor_defs(self.cfg))
             if layout_changed:
                 self._build()
@@ -1046,7 +1061,7 @@ if __name__ == "__main__":
     if os.path.exists(ico):
         app.setWindowIcon(QIcon(ico))
 
-    is_first_run = not os.path.exists(SETTINGS_FILE)
+    is_first_run = _detect_first_run()
 
     # ── Startup registry: keep our own entry fresh, drop the pre-rename one ───
     # The old build registered "Palantir" pointing at a path the rename removed;

@@ -298,9 +298,9 @@ def test_update_checkers_stay_referenced_while_their_thread_runs(make, monkeypat
     class FakeChecker(QObject):
         update_available = pyqtSignal(str, str, str)
         no_update = pyqtSignal()
-        check_failed = pyqtSignal()
+        check_failed = pyqtSignal(str)
 
-        def __init__(self, owner, repo, parent=None):
+        def __init__(self, owner, repo, manual=False):
             super().__init__()
             self._thread = FakeThread()
 
@@ -354,3 +354,87 @@ def test_settings_dialog_opens_on_the_overlays_monitor(make, monkeypatch):
     w._open_settings()
     x, y = moves[0]
     assert s2.geometry().contains(x + 200, y + 300)
+
+
+# ── Wiring of the merged audit fixes ──────────────────────────────────────────
+def test_first_run_detection_uses_cfg_is_first_run(monkeypatch):
+    import istari
+    monkeypatch.setattr(istari, "_cfg_is_first_run", lambda: False)
+    assert istari._detect_first_run() is False
+    monkeypatch.setattr(istari, "_cfg_is_first_run", lambda: True)
+    assert istari._detect_first_run() is True
+
+
+def test_ping_target_applied_at_startup_and_after_settings(make, monkeypatch):
+    import istari
+    seen = []
+    monkeypatch.setattr(istari, "set_ping_target", seen.append)
+    w = make([S1()], ping_target="example.org:8443")
+    assert seen == ["example.org:8443"]
+
+    class Dlg:
+        def __init__(self, cfg, parent): self.cfg = cfg
+        def adjustSize(self): pass
+        def width(self): return 10
+        def height(self): return 10
+        def move(self, *_): pass
+        def exec(self):
+            self.cfg["ping_target"] = "1.1.1.1:53"
+            return True
+
+    monkeypatch.setattr(istari, "SettingsDialog", Dlg)
+    w._open_settings()
+    assert seen[-1] == "1.1.1.1:53"
+
+
+def _recording_checker(monkeypatch):
+    import istari
+    made = []
+
+    class Checker(QObject):
+        update_available = pyqtSignal(str, str, str)
+        no_update = pyqtSignal()
+        check_failed = pyqtSignal(str)
+
+        def __init__(self, owner, repo, manual=False):
+            super().__init__()
+            self.manual = manual
+            self._thread = None
+            made.append(self)
+
+        def start(self): pass
+
+    monkeypatch.setattr(istari, "UpdateChecker", Checker)
+    return made
+
+
+def test_manual_flag_reaches_update_checker(make, monkeypatch):
+    made = _recording_checker(monkeypatch)
+    w = make([S1()])
+    w._check_for_updates(manual=True)
+    assert made[-1].manual is True
+    w._updater_running = False
+    w._check_for_updates(manual=False)
+    assert made[-1].manual is False
+
+
+def test_manual_check_failure_shows_its_reason(make, monkeypatch):
+    made = _recording_checker(monkeypatch)
+    w = make([S1()])
+    shown = []
+    monkeypatch.setattr(w._tray, "showMessage", lambda *a: shown.append(a))
+    w._check_for_updates(manual=True)
+    made[-1].check_failed.emit("GitHub rate limit reached")
+    assert shown and shown[0][1] == "GitHub rate limit reached"
+    assert w._updater_running is False
+
+
+def test_automatic_check_failure_does_not_pop_up(make, monkeypatch):
+    made = _recording_checker(monkeypatch)
+    w = make([S1()])
+    shown = []
+    monkeypatch.setattr(w._tray, "showMessage", lambda *a: shown.append(a))
+    w._check_for_updates(manual=False)
+    made[-1].check_failed.emit("offline")
+    assert shown == []
+    assert w._updater_running is False

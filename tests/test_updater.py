@@ -573,3 +573,12 @@ def test_trim_notes_cuts_on_a_boundary():
     assert out.endswith("…") and len(out) <= 321
     assert not out[:-1].endswith("wor")
     assert _trim_notes("short") == "short"
+
+
+# ── OV-12: no ignored parent argument ─────────────────────────────────────────
+def test_update_checker_has_no_ignored_parent_argument():
+    import inspect
+    # A parented QObject cannot be moved to the worker thread, so the checker
+    # is parentless and callers keep their own reference.
+    assert "parent" not in inspect.signature(UpdateChecker.__init__).parameters
+    assert UpdateChecker("o", "r").parent() is None

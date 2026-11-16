@@ -209,7 +209,7 @@ class UpdateChecker(QObject):
     no_update        = pyqtSignal()
     check_failed     = pyqtSignal(str)
 
-    def __init__(self, owner: str, repo: str, parent=None, manual: bool = False):
+    def __init__(self, owner: str, repo: str, manual: bool = False):
         super().__init__()
         self._owner = owner
         self._repo  = repo
