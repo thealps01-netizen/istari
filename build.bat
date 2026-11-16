@@ -18,35 +18,42 @@ if errorlevel 1 (
 :: dependencies, and the project folder may sit in a synced directory.
 set "VENV=%LOCALAPPDATA%\Istari\build-venv"
 if not exist "%VENV%\Scripts\python.exe" (
-    echo  [1/5] Creating build venv: %VENV%
+    echo  [1/6] Creating build venv: %VENV%
     python -m venv "%VENV%"
     if errorlevel 1 ( echo  ERROR: could not create the build venv. & pause & exit /b 1 )
 )
 set "PY=%VENV%\Scripts\python.exe"
 
 :: ── Install dependencies (pinned) ─────────────────────────────────────────────
-echo  [1/5] Installing dependencies...
+echo  [1/6] Installing dependencies...
 "%PY%" -m pip install -r requirements-dev.txt --quiet
 if errorlevel 1 ( echo  ERROR: pip failed. & pause & exit /b 1 )
 
 :: ── Generate icon ─────────────────────────────────────────────────────────────
-echo  [2/5] Generating icon...
+echo  [2/6] Generating icon...
 "%PY%" tools\make_icon.py
-if errorlevel 1 ( echo  WARNING: Icon generation failed, building without icon. )
+if errorlevel 1 ( echo  ERROR: icon generation failed; not packaging a stale istari.ico. & pause & exit /b 1 )
+
+:: ── Tests ─────────────────────────────────────────────────────────────────────
+:: The same suite CI runs before it publishes; a red suite is not packaged.
+echo  [3/6] Running tests...
+set "QT_QPA_PLATFORM=offscreen"
+"%PY%" -m pytest tests -q
+if errorlevel 1 ( echo  ERROR: tests failed. & pause & exit /b 1 )
 
 :: ── Version metadata ─────────────────────────────────────────────────────────
 :: Single writer of the derived version files (see tools/version_sync.py).
-echo  [3/5] Syncing version metadata...
+echo  [4/6] Syncing version metadata...
 "%PY%" tools\version_sync.py --inject
 if errorlevel 1 ( echo  ERROR: version sync failed. & pause & exit /b 1 )
 
 :: ── Build exe (onedir via Istari.spec) ─────────────────────────────────────
-echo  [4/5] Building Istari.exe...
+echo  [5/6] Building Istari.exe...
 "%PY%" -m PyInstaller Istari.spec --noconfirm
 if errorlevel 1 ( echo  ERROR: PyInstaller build failed. & pause & exit /b 1 )
 
 :: ── Create installer with Inno Setup ─────────────────────────────────────────
-echo  [5/5] Creating installer...
+echo  [6/6] Creating installer...
 
 :: Try PATH first, then common install locations
 set ISCC=
@@ -72,11 +79,13 @@ if defined ISCC (
     echo.
 ) else (
     echo.
-    echo  Inno Setup not found — skipping installer.
-    echo  Portable exe: dist\Istari.exe
+    echo  ERROR: Inno Setup 6 not found - no installer was produced.
+    echo  The app itself was built: dist\Istari\Istari.exe
     echo.
-    echo  To create a proper installer:
-    echo    1. Download Inno Setup from https://jrsoftware.org/isinfo.php
+    echo  To create the installer:
+    echo    1. Download Inno Setup 6 from https://jrsoftware.org/isinfo.php
     echo    2. Run this build.bat again
+    pause
+    exit /b 2
 )
 pause

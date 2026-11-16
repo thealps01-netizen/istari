@@ -19,12 +19,15 @@ import os
 import sys
 import ssl
 import hashlib
+import shutil
 import tempfile
+import time
+import urllib.parse
 import urllib.request
 import urllib.error
 import json
 
-from PyQt6.QtCore    import QThread, pyqtSignal, QObject, Qt, QPoint, QRectF
+from PyQt6.QtCore    import QThread, pyqtSignal, QObject, Qt, QPoint, QRectF, QTimer
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QProgressBar, QApplication, QFrame, QWidget,
@@ -41,14 +44,31 @@ _active: list = []
 
 # ── Version comparison ─────────────────────────────────────────────────────────
 
-def _parse(tag: str) -> tuple[int, ...]:
-    """'v1.2.3' → (1, 2, 3)"""
-    nums = re.findall(r"\d+", tag)
-    return tuple(int(n) for n in nums)
+_TAG_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 
 
-def _is_newer(remote_tag: str, current: str = __version__) -> bool:
-    return _parse(remote_tag) > _parse(current)
+def _parse(tag) -> tuple[int, int, int] | None:
+    """'v1.2.3' → (1, 2, 3); anything that is not exactly MAJOR.MINOR.PATCH → None.
+
+    Pre-release, build-metadata and four-part tags are refused rather than
+    guessed at: release.yml only ever publishes vMAJOR.MINOR.PATCH, so any other
+    shape is a hand-made release the updater must not offer.
+    """
+    if not isinstance(tag, str):
+        return None
+    m = _TAG_RE.match(tag.strip())
+    return tuple(int(n) for n in m.groups()) if m else None
+
+
+def _is_newer(remote_tag, current: str = __version__) -> bool:
+    remote, local = _parse(remote_tag), _parse(current)
+    if remote is None:
+        _log.warning("Ignoring release tag %r: not vMAJOR.MINOR.PATCH", remote_tag)
+        return False
+    if local is None:
+        _log.warning("Current version %r is not MAJOR.MINOR.PATCH; no update offered", current)
+        return False
+    return remote > local
 
 
 # ── GitHub API fetch ───────────────────────────────────────────────────────────
@@ -57,7 +77,28 @@ GITHUB_API = "https://api.github.com/repos/{owner}/{repo}/releases/latest"
 TIMEOUT    = 8   # seconds
 
 
+# Why a check failed → what the user is told (UP-9). Keys are the reason codes
+# returned by _fetch_release().
+_FAILURE_TEXT = {
+    "rate_limit": "GitHub rate limit reached. Try again in a while.",
+    "not_found":  "No Istari release was found on GitHub.",
+    "http":       "GitHub returned an error. Try again later.",
+    "network":    "Could not reach the update server. Check your connection.",
+    "invalid":    "The update server sent an unexpected reply.",
+    "error":      "The update check failed. See the log for details.",
+}
+
+
+def failure_text(reason: str) -> str:
+    return _FAILURE_TEXT.get(reason, _FAILURE_TEXT["error"])
+
+
 def _fetch_latest(owner: str, repo: str) -> dict | None:
+    return _fetch_release(owner, repo)[0]
+
+
+def _fetch_release(owner: str, repo: str) -> tuple[dict | None, str]:
+    """(release, "") on success, (None, reason) on failure — see _FAILURE_TEXT."""
     url = GITHUB_API.format(owner=owner, repo=repo)
     req = urllib.request.Request(
         url,
@@ -69,22 +110,47 @@ def _fetch_latest(owner: str, repo: str) -> dict | None:
     try:
         ctx = ssl.create_default_context()
         with urllib.request.urlopen(req, timeout=TIMEOUT, context=ctx) as r:
-            return json.loads(r.read().decode())
+            return json.loads(r.read().decode()), ""
     except urllib.error.HTTPError as e:
         _log.warning("GitHub API HTTP %s for %s/%s", e.code, owner, repo)
+        if e.code in (403, 429):
+            return None, "rate_limit"
+        return None, "not_found" if e.code == 404 else "http"
     except urllib.error.URLError as e:
-        _log.debug("Update check skipped (no network?): %s", e.reason)
+        _log.warning("Update check skipped (no network?): %s", e.reason)
+        return None, "network"
+    except ValueError as e:   # json.JSONDecodeError / UnicodeDecodeError
+        _log.error("Update check: unreadable reply: %s", e)
+        return None, "invalid"
     except Exception as e:
         _log.error("Update check error: %s", e)
-    return None
+        return None, "error"
+
+
+INSTALLER_NAME = "Istari_Setup.exe"
 
 
 def _find_installer_asset(release: dict) -> str | None:
-    """Return download URL of the first .exe asset, or None."""
-    for asset in release.get("assets", []):
-        if asset.get("name", "").lower().endswith(".exe"):
-            return asset["browser_download_url"]
+    """Download URL of the asset named Istari_Setup.exe, or None.
+
+    Selected by name, not by extension: any other .exe attached to a release is
+    not the installer and must never be downloaded and run elevated.
+    """
+    assets = release.get("assets") if isinstance(release, dict) else None
+    for asset in assets or []:
+        if not isinstance(asset, dict):
+            continue
+        if str(asset.get("name", "")).lower() == INSTALLER_NAME.lower():
+            return asset.get("browser_download_url")
     return None
+
+
+class ChecksumMissing(RuntimeError):
+    """The release publishes no readable SHA256 for the installer."""
+
+
+class ChecksumMismatch(ValueError):
+    """The downloaded installer does not match its published SHA256."""
 
 
 def _fetch_expected_sha256(installer_url: str) -> str | None:
@@ -132,17 +198,22 @@ class UpdateChecker(QObject):
     Signals:
         update_available(str tag, str download_url, str release_notes)
         no_update()
-        check_failed()
+        check_failed(str message)   # user-facing reason; slots may ignore it
+
+    Exactly one of the three signals is emitted per run, whatever the reply
+    looks like, and the thread always ends — callers reset their "checking"
+    flag from these signals.
     """
 
     update_available = pyqtSignal(str, str, str)  # (tag, download_url, notes)
     no_update        = pyqtSignal()
-    check_failed     = pyqtSignal()
+    check_failed     = pyqtSignal(str)
 
-    def __init__(self, owner: str, repo: str, parent=None):
+    def __init__(self, owner: str, repo: str, parent=None, manual: bool = False):
         super().__init__()
         self._owner = owner
         self._repo  = repo
+        self._manual = manual   # a manual check ignores "Skip This Version"
         self._thread = QThread()
         self.moveToThread(self._thread)
         self._thread.started.connect(self._run)
@@ -152,6 +223,15 @@ class UpdateChecker(QObject):
         self._thread.start()
 
     def _run(self) -> None:
+        try:
+            self._check()
+        except Exception as e:
+            _log.exception("Update check crashed: %s", e)
+            self.check_failed.emit(failure_text("error"))
+        finally:
+            self._thread.quit()
+
+    def _check(self) -> None:
         _log.debug("Checking for updates (%s/%s, current=%s)",
                    self._owner, self._repo, __version__)
 
@@ -159,37 +239,75 @@ class UpdateChecker(QObject):
         from cfg import load_cfg
         skipped = load_cfg().get("skipped_version", "")
 
-        release = _fetch_latest(self._owner, self._repo)
+        release, reason = _fetch_release(self._owner, self._repo)
         if release is None:
-            self.check_failed.emit()
-        else:
-            tag = release.get("tag_name", "")
-            if tag and tag == skipped:
-                _log.debug("Version %s skipped by user.", tag)
-                self.no_update.emit()
-            elif _is_newer(tag):
-                url   = _find_installer_asset(release)
-                notes = release.get("body", "") or ""
-                if url:
-                    _log.info("Update available: %s (asset: %s)", tag, url)
-                    self.update_available.emit(tag, url, notes)
-                else:
-                    _log.info("Update %s found but no .exe asset attached.", tag)
-                    self.no_update.emit()
+            self.check_failed.emit(failure_text(reason))
+            return
+        tag = release.get("tag_name") if isinstance(release, dict) else None
+        if not isinstance(tag, str) or not tag:
+            _log.error("Update check: reply has no usable tag_name: %.200r", release)
+            self.check_failed.emit(failure_text("invalid"))
+            return
+
+        if tag == skipped and not self._manual:
+            _log.debug("Version %s skipped by user.", tag)
+            self.no_update.emit()
+        elif _is_newer(tag):
+            url   = _find_installer_asset(release)
+            notes = release.get("body") or ""
+            if url:
+                _log.info("Update available: %s (asset: %s)", tag, url)
+                self.update_available.emit(tag, url, str(notes))
             else:
-                _log.debug("Already up to date (%s).", __version__)
+                _log.info("Update %s found but no %s asset attached.", tag, INSTALLER_NAME)
                 self.no_update.emit()
-        self._thread.quit()
+        else:
+            _log.debug("Already up to date (%s).", __version__)
+            self.no_update.emit()
 
 
 # ── Download + launch installer ────────────────────────────────────────────────
 
-class InstallerDownloader(QObject):
-    """Downloads the installer to a temp file then runs it."""
+DOWNLOAD_TIMEOUT = 30          # seconds without data before a download gives up
+_CHUNK           = 64 * 1024
+_TMP_PREFIX      = "istari_update_"
+_STALE_AGE       = 3600        # seconds; older leftover update dirs are deleted
 
-    progress = pyqtSignal(int)    # 0-100
-    finished = pyqtSignal(str)    # path to downloaded installer
-    error    = pyqtSignal(str)
+
+def _cleanup_stale_update_dirs(max_age: float = _STALE_AGE) -> None:
+    """Remove `istari_update_*` temp dirs left by earlier runs.
+
+    A successful update leaves its installer behind (it is still running when the
+    app quits), so only dirs older than `max_age` are touched.
+    """
+    base = tempfile.gettempdir()
+    try:
+        names = os.listdir(base)
+    except OSError as e:
+        _log.warning("Could not list %s to clean old updates: %s", base, e)
+        return
+    now = time.time()
+    for name in names:
+        if not name.startswith(_TMP_PREFIX):
+            continue
+        path = os.path.join(base, name)
+        try:
+            if now - os.path.getmtime(path) > max_age:
+                shutil.rmtree(path)
+                _log.info("Removed stale update folder %s", path)
+        except OSError as e:
+            _log.warning("Could not remove stale update folder %s: %s", path, e)
+
+
+class InstallerDownloader(QObject):
+    """Downloads the installer to a temp file, verifies it, then reports its path."""
+
+    progress  = pyqtSignal(int)    # 0-100
+    finished  = pyqtSignal(str)    # path to downloaded, verified installer
+    error     = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    _cancel = False
 
     def __init__(self, url: str, parent=None):
         super().__init__()
@@ -201,40 +319,78 @@ class InstallerDownloader(QObject):
     def start(self) -> None:
         self._thread.start()
 
+    def cancel(self) -> None:
+        """Ask the download to stop; checked between chunks (thread-safe flag)."""
+        self._cancel = True
+
     def _run(self) -> None:
+        tmp_dir = None
+        ok = False
         try:
-            suffix  = os.path.basename(self._url.split("?")[0]) or "Istari_Setup.exe"
-            tmp_dir = tempfile.mkdtemp(prefix="istari_update_")
-            dest    = os.path.join(tmp_dir, suffix)
-            _log.info("Downloading update from %s → %s", self._url, dest)
+            _cleanup_stale_update_dirs()
 
-            def _reporthook(block, block_size, total):
-                if total > 0:
-                    pct = min(int(block * block_size * 100 / total), 100)
-                    self.progress.emit(pct)
-
-            urllib.request.urlretrieve(self._url, dest, reporthook=_reporthook)
-            self.progress.emit(100)
-            _log.info("Download complete: %s", dest)
-
-            # Integrity check — an unverified installer is never executed.
+            # Checksum first: a release without one is refused before any
+            # megabytes are fetched.
             expected_hash = _fetch_expected_sha256(self._url)
             if not expected_hash:
-                raise RuntimeError(
+                raise ChecksumMissing(
                     "No SHA256 checksum published for this release, so the "
                     "installer cannot be verified."
                 )
+
+            name    = os.path.basename(urllib.parse.urlsplit(self._url).path) or INSTALLER_NAME
+            tmp_dir = tempfile.mkdtemp(prefix=_TMP_PREFIX)
+            dest    = os.path.join(tmp_dir, name)
+            _log.info("Downloading update from %s → %s", self._url, dest)
+
+            if not self._download(dest):
+                _log.info("Update download cancelled by the user.")
+                self.cancelled.emit()
+                return
+            self.progress.emit(100)
+            _log.info("Download complete: %s", dest)
+
             actual_hash = _sha256_of(dest)
             if actual_hash != expected_hash:
-                raise ValueError(f"SHA256 mismatch: expected {expected_hash}, got {actual_hash}")
+                raise ChecksumMismatch(
+                    f"SHA256 mismatch: expected {expected_hash}, got {actual_hash}")
             _log.info("SHA256 verified OK: %s", actual_hash)
 
+            ok = True
             self.finished.emit(dest)
         except Exception as e:
             _log.error("Download failed: %s", e)
             self.error.emit(str(e))
         finally:
+            # Keep the folder only when the verified installer is about to run.
+            if tmp_dir and not ok:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
             self._thread.quit()
+
+    def _download(self, dest: str) -> bool:
+        """Stream the URL into `dest` via a .part file. False when cancelled."""
+        part = dest + ".part"
+        req = urllib.request.Request(
+            self._url, headers={"User-Agent": f"Istari-Updater/{__version__}"})
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT, context=ctx) as r, \
+                open(part, "wb") as f:
+            total = int(r.headers.get("Content-Length") or 0)
+            done  = 0
+            while True:
+                if self._cancel:
+                    return False
+                chunk = r.read(_CHUNK)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if total > 0:
+                    self.progress.emit(min(done * 100 // total, 99))
+        if total > 0 and done != total:
+            raise OSError(f"Download incomplete: got {done} of {total} bytes")
+        os.replace(part, dest)
+        return True
 
 
 # ── Reusable UI helpers ────────────────────────────────────────────────────────
@@ -363,6 +519,20 @@ QProgressBar::chunk {
 """
 
 
+def _trim_notes(notes: str, limit: int = 320) -> str:
+    """Release notes cut at a line/word boundary so markdown is not sliced mid-token."""
+    s = notes.strip()
+    if len(s) <= limit:
+        return s
+    cut = s[:limit]
+    for sep in ("\n", " "):
+        pos = cut.rfind(sep)
+        if pos > limit // 2:
+            cut = cut[:pos]
+            break
+    return cut.rstrip() + "…"
+
+
 class UpdateDialog(_DraggableDialog):
     """Modern dark-themed update dialog."""
 
@@ -432,7 +602,10 @@ class UpdateDialog(_DraggableDialog):
 
         # ── Release notes (trimmed) ────────────────────────────────────────────
         if notes and notes.strip():
-            notes_lbl = QLabel(notes.strip()[:320] + ("…" if len(notes.strip()) > 320 else ""))
+            notes_lbl = QLabel(_trim_notes(notes))
+            # Markdown, not AutoText: GitHub release notes are markdown, and Qt's
+            # markdown reader does not treat <tags> as rich text.
+            notes_lbl.setTextFormat(Qt.TextFormat.MarkdownText)
             notes_lbl.setObjectName("notes_label")
             notes_lbl.setWordWrap(True)
             inner.addWidget(notes_lbl)
@@ -482,12 +655,14 @@ class UpdateDialog(_DraggableDialog):
 class DownloadProgressDialog(_DraggableDialog):
     """Minimal dark progress dialog for installer download."""
 
+    cancel_requested = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Istari — Downloading")
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setFixedSize(360, 120)
+        self.setFixedSize(360, 160)
         self.setStyleSheet(_STYLE)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
 
@@ -516,6 +691,18 @@ class DownloadProgressDialog(_DraggableDialog):
         self._pct_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
         layout.addWidget(self._pct_lbl)
 
+        self._btn_cancel = QPushButton("Cancel")
+        self._btn_cancel.setObjectName("btn_later")
+        self._btn_cancel.clicked.connect(self._on_cancel)
+        layout.addWidget(self._btn_cancel, 0, Qt.AlignmentFlag.AlignRight)
+
+    def _on_cancel(self) -> None:
+        self._btn_cancel.setEnabled(False)
+        self.cancel_requested.emit()
+
+    def reject(self) -> None:          # Esc = Cancel
+        self._on_cancel()
+
     def set_progress(self, pct: int) -> None:
         self._bar.setValue(pct)
         self._pct_lbl.setText(f"{pct}%")
@@ -528,6 +715,7 @@ class DownloadProgressDialog(_DraggableDialog):
                 child.setText("Installing update…")
                 break
         self._bar.setRange(0, 0)
+        self._btn_cancel.hide()
         self._pct_lbl.setText("please wait")
         QApplication.processEvents()
 
@@ -537,6 +725,13 @@ class DownloadProgressDialog(_DraggableDialog):
 def _friendly_error(raw: str) -> tuple[str, str]:
     """Return (title, body) user-friendly message from a raw exception string."""
     r = raw.lower()
+    if "sha256 mismatch" in r:
+        return (
+            "Download Corrupted",
+            "The downloaded installer did not match its published checksum,\n"
+            "so it was deleted and not run. Please try again.\n"
+            "If it keeps happening, download it manually from the release page.",
+        )
     if "checksum" in r or "sha256" in r:
         return (
             "Update Could Not Be Verified",
@@ -636,13 +831,88 @@ class _ErrorDialog(_DraggableDialog):
             super().keyPressEvent(e)
 
 
-def _show_download_error(raw: str, parent=None) -> None:
-    title, body = _friendly_error(raw)
-    _log.warning("Download error shown to user: %s | raw: %s", title, raw)
+def _show_message(title: str, body: str, parent=None) -> None:
     dlg = _ErrorDialog(title, body, parent)
     dlg.adjustSize()
     dlg._center_on_screen()
     dlg.exec()
+
+
+def _show_download_error(raw: str, parent=None) -> None:
+    title, body = _friendly_error(raw)
+    _log.warning("Download error shown to user: %s | raw: %s", title, raw)
+    _show_message(title, body, parent)
+
+
+ERROR_CANCELLED = 1223   # ERROR_CANCELLED: the user declined the UAC prompt
+
+
+def _launch_installer(path: str) -> int | None:
+    """Start the installer elevated. None when it started, else the Win32 error."""
+    import ctypes
+
+    # ShellExecuteExW — proper struct-based API, avoids return-type truncation
+    # issues that plagued ShellExecuteW on 64-bit, and reliably passes args.
+    class _SEI(ctypes.Structure):
+        _fields_ = [
+            ("cbSize",         ctypes.c_uint32),
+            ("fMask",          ctypes.c_uint32),
+            ("hwnd",           ctypes.c_void_p),
+            ("lpVerb",         ctypes.c_wchar_p),
+            ("lpFile",         ctypes.c_wchar_p),
+            ("lpParameters",   ctypes.c_wchar_p),
+            ("lpDirectory",    ctypes.c_wchar_p),
+            ("nShow",          ctypes.c_int),
+            ("hInstApp",       ctypes.c_void_p),
+            ("lpIDList",       ctypes.c_void_p),
+            ("lpClass",        ctypes.c_wchar_p),
+            ("hkeyClass",      ctypes.c_void_p),
+            ("dwHotKey",       ctypes.c_uint32),
+            ("hIconOrMonitor", ctypes.c_void_p),
+            ("hProcess",       ctypes.c_void_p),
+        ]
+
+    sei = _SEI()
+    sei.cbSize       = ctypes.sizeof(_SEI)
+    sei.lpVerb       = "runas"
+    sei.lpFile       = path
+    sei.lpParameters = "/VERYSILENT /NORESTART"
+    sei.lpDirectory  = os.path.dirname(path)
+    sei.nShow        = 1  # SW_SHOWNORMAL (so UAC dialog is visible)
+
+    shell32 = ctypes.windll.shell32
+    shell32.ShellExecuteExW.restype = ctypes.c_bool
+    if shell32.ShellExecuteExW(ctypes.byref(sei)):
+        return None
+    return ctypes.windll.kernel32.GetLastError()
+
+
+def _start_install(path: str, prog, quit_fn, parent=None) -> bool:
+    """Run the verified installer and quit only if it really started.
+
+    On failure or a declined UAC prompt the app keeps running and the user is
+    told; quitting here would leave them with no overlay and no update.
+    """
+    prog.set_installing()
+    _log.info("Launching installer: %s", path)
+    err = _launch_installer(path)
+    if err is None:
+        _log.info("Installer launched via ShellExecuteExW")
+        QTimer.singleShot(500, quit_fn)
+        return True
+
+    _log.error("ShellExecuteExW failed (err=%d) — installer not launched", err)
+    prog.close()
+    shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+    if err == ERROR_CANCELLED:
+        body = ("The update was not installed because administrator permission "
+                "was not granted.\nIstari keeps running; you can update again "
+                "from the tray menu.")
+    else:
+        body = (f"The installer could not be started (error {err}).\n"
+                "Istari keeps running; you can try again from the tray menu.")
+    _show_message("Update Not Installed", body, parent)
+    return False
 
 
 # ── High-level helper called from main UI ──────────────────────────────────────
@@ -680,52 +950,16 @@ def prompt_and_install(tag: str, download_url: str, notes: str = "", parent=None
     def _on_progress(pct: int):
         prog.set_progress(pct)
 
+    quit_fn = (parent._quit if parent is not None and hasattr(parent, "_quit")
+               else QApplication.instance().quit)
+
     def _on_finished(path: str):
         _active.clear()
-        prog.set_installing()
-        _log.info("Launching installer: %s", path)
-        import ctypes
+        _start_install(path, prog, quit_fn, parent)
 
-        # ShellExecuteExW — proper struct-based API, avoids return-type truncation
-        # issues that plagued ShellExecuteW on 64-bit, and reliably passes args.
-        class _SEI(ctypes.Structure):
-            _fields_ = [
-                ("cbSize",         ctypes.c_uint32),
-                ("fMask",          ctypes.c_uint32),
-                ("hwnd",           ctypes.c_void_p),
-                ("lpVerb",         ctypes.c_wchar_p),
-                ("lpFile",         ctypes.c_wchar_p),
-                ("lpParameters",   ctypes.c_wchar_p),
-                ("lpDirectory",    ctypes.c_wchar_p),
-                ("nShow",          ctypes.c_int),
-                ("hInstApp",       ctypes.c_void_p),
-                ("lpIDList",       ctypes.c_void_p),
-                ("lpClass",        ctypes.c_wchar_p),
-                ("hkeyClass",      ctypes.c_void_p),
-                ("dwHotKey",       ctypes.c_uint32),
-                ("hIconOrMonitor", ctypes.c_void_p),
-                ("hProcess",       ctypes.c_void_p),
-            ]
-
-        sei = _SEI()
-        sei.cbSize       = ctypes.sizeof(_SEI)
-        sei.lpVerb       = "runas"
-        sei.lpFile       = path
-        sei.lpParameters = "/VERYSILENT /NORESTART"
-        sei.lpDirectory  = os.path.dirname(path)
-        sei.nShow        = 1  # SW_SHOWNORMAL (so UAC dialog is visible)
-
-        shell32 = ctypes.windll.shell32
-        shell32.ShellExecuteExW.restype = ctypes.c_bool
-        ok = shell32.ShellExecuteExW(ctypes.byref(sei))
-        if ok:
-            _log.info("Installer launched via ShellExecuteExW")
-        else:
-            err = ctypes.windll.kernel32.GetLastError()
-            _log.error("ShellExecuteExW failed (err=%d) — installer not launched", err)
-
-        from PyQt6.QtCore import QTimer
-        QTimer.singleShot(500, parent._quit if parent and hasattr(parent, '_quit') else QApplication.instance().quit)
+    def _on_cancelled():
+        _active.clear()
+        prog.close()
 
     def _on_error(msg_text: str):
         _active.clear()
@@ -735,4 +969,6 @@ def prompt_and_install(tag: str, download_url: str, notes: str = "", parent=None
     downloader.progress.connect(_on_progress)
     downloader.finished.connect(_on_finished)
     downloader.error.connect(_on_error)
+    downloader.cancelled.connect(_on_cancelled)
+    prog.cancel_requested.connect(downloader.cancel, Qt.ConnectionType.DirectConnection)
     downloader.start()

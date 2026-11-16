@@ -118,3 +118,48 @@ def test_from_tag_writes_version_py_and_the_derived_files(tree):
     assert "u'1.0.23.0'" in (tree / "file_version_info.txt").read_text()
     assert '#define AppVersion "1.0.23"' in (tree / "istari.iss").read_text()
     assert version_sync.drift() == []
+
+
+# ══ Release guard and publisher ownership ════════════════════════════════════
+
+@pytest.mark.parametrize("tag,previous,ok", [
+    ("v1.0.25", "v1.0.24", True),
+    ("v1.0.25", "",        True),     # first release
+    ("v1.0.25", None,      True),
+    ("v1.1.0",  "v1.0.99", True),
+    ("v1.0.10", "v1.0.9",  True),     # numeric, not lexical
+    ("v1.0.24", "v1.0.24", False),    # duplicate
+    ("v1.0.23", "v1.0.24", False),    # downgrade
+    ("v0.9.9",  "v1.0.24", False),
+    ("v1.0.25-rc1", "v1.0.24", False),
+    ("1.0.25",  "v1.0.24", True),
+])
+def test_check_tag_newer(tag, previous, ok):
+    assert (version_sync.check_tag_newer(tag, previous) is None) is ok
+
+
+def test_check_tag_cli_exit_codes(capsys):
+    assert version_sync.main(["--check-tag", "v1.0.25", "--previous", "v1.0.24"]) == 0
+    assert version_sync.main(["--check-tag", "v1.0.23", "--previous", "v1.0.24"]) == 1
+    assert "not newer" in capsys.readouterr().err
+    assert version_sync.main(["--check-tag", "v1.0.1"]) == 0     # no previous release
+
+
+def test_inject_owns_the_publisher_name(tree):
+    (tree / "file_version_info.txt").write_text(
+        INFO_SAMPLE.replace("StringStruct(u'FileVersion'",
+                            "StringStruct(u'CompanyName', u'someone else'),\n      StringStruct(u'FileVersion'"),
+        encoding="utf-8")
+    (tree / "istari.iss").write_text(
+        ISS_SAMPLE + "AppPublisher=Somebody\nVersionInfoCompany=Somebody\n", encoding="utf-8")
+
+    version_sync.inject()
+
+    info = (tree / "file_version_info.txt").read_text()
+    iss = (tree / "istari.iss").read_text()
+    assert f"u'{version_sync.PUBLISHER}'" in info and "someone else" not in info
+    assert f"AppPublisher={version_sync.PUBLISHER}" in iss
+    assert f"VersionInfoCompany={version_sync.PUBLISHER}" in iss
+    assert "Somebody" not in iss
+    assert version_sync.drift() == []
+

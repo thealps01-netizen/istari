@@ -11,6 +11,12 @@ Usage (from the repository root, or with paths given explicitly):
     python tools/version_sync.py --from-tag v1.0.23   # tag   -> version.py
     python tools/version_sync.py --inject             # version.py -> derived files
     python tools/version_sync.py --check              # verify only; exit 1 on drift
+    python tools/version_sync.py --check-tag v1.0.25 --previous v1.0.24
+                                                      # release guard; exit 1 unless newer
+
+The publisher name is also owned here: it is written into `file_version_info.txt`
+(CompanyName) and `istari.iss` (AppPublisher, VersionInfoCompany), so the exe
+properties, the installer and Add/Remove Programs cannot disagree.
 """
 
 import argparse
@@ -23,6 +29,8 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 VERSION_PY   = REPO / "version.py"
 VERSION_INFO = REPO / "file_version_info.txt"
 ISS          = REPO / "istari.iss"
+
+PUBLISHER    = "thealps01-netizen"
 
 _SEMVER      = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 _RELEASE_VER = re.compile(r"^\d+\.\d+\.\d+$")
@@ -70,6 +78,7 @@ def _expected_version_info(version: str) -> str:
     text = re.sub(r"(u?'FileVersion',\s*u?)'[^']*'", rf"\g<1>'{version}.0'", text)
     text = re.sub(r"(u?'ProductVersion',\s*u?)'[^']*'",
                   rf"\g<1>'{version}.0'", text)
+    text = re.sub(r"(u?'CompanyName',\s*u?)'[^']*'", rf"\g<1>'{PUBLISHER}'", text)
     return text
 
 
@@ -80,7 +89,29 @@ def _expected_iss(version: str) -> str:
     in step means a manual build does not silently stamp an ancient version.
     """
     text = ISS.read_text(encoding="utf-8")
-    return re.sub(r'(#define AppVersion\s+)"[^"]*"', rf'\g<1>"{version}"', text, count=1)
+    text = re.sub(r'(#define AppVersion\s+)"[^"]*"', rf'\g<1>"{version}"', text, count=1)
+    text = re.sub(r"^(AppPublisher=).*$", rf"\g<1>{PUBLISHER}", text, flags=re.M)
+    return re.sub(r"^(VersionInfoCompany=).*$", rf"\g<1>{PUBLISHER}", text, flags=re.M)
+
+
+def check_tag_newer(tag: str, previous: str | None) -> str | None:
+    """Release guard: None when `tag` may be published, else the reason it may not.
+
+    `previous` is the tag of the latest published release (empty/None when there
+    is none). A tag that is not strictly greater would reach clients as a
+    downgrade or a duplicate.
+    """
+    new = _SEMVER.match(tag.strip())
+    if not new:
+        return f"tag is not vMAJOR.MINOR.PATCH: {tag!r}"
+    if not previous or not previous.strip():
+        return None
+    old = _SEMVER.match(previous.strip())
+    if not old:
+        return f"latest published release has an unparsable tag: {previous!r}"
+    if tuple(map(int, new.groups())) <= tuple(map(int, old.groups())):
+        return f"tag {tag} is not newer than the latest published release {previous}"
+    return None
 
 
 def drift(version: str | None = None) -> list[str]:
@@ -123,7 +154,20 @@ def main(argv: list[str] | None = None) -> int:
                        help="rewrite the derived files from version.py (build)")
     group.add_argument("--check", action="store_true",
                        help="report drift and exit 1 without writing anything")
+    group.add_argument("--check-tag", metavar="TAG",
+                       help="exit 1 unless TAG is newer than --previous (CI release guard)")
+    parser.add_argument("--previous", metavar="TAG", default="",
+                        help="latest published release tag; empty when there is none")
     args = parser.parse_args(argv)
+
+    if args.check_tag is not None:
+        problem = check_tag_newer(args.check_tag, args.previous)
+        if problem:
+            print(problem, file=sys.stderr)
+            return 1
+        print(f"tag {args.check_tag.strip()} is newer than "
+              f"{args.previous.strip() or 'the (absent) previous release'}")
+        return 0
 
     if args.from_tag is not None:
         # Dispatch on `is not None`, never on truthiness: a workflow that fails to
