@@ -23,11 +23,9 @@ def test_parse_standard_tag():
 def test_parse_no_v_prefix():
     assert _parse("2.0.0") == (2, 0, 0)
 
-def test_parse_single_digit():
-    assert _parse("v1") == (1,)
-
-def test_parse_four_parts():
-    assert _parse("v1.2.3.4") == (1, 2, 3, 4)
+@pytest.mark.parametrize("tag", ["v1", "v1.2.3.4", "v1.0.25-rc1", "v1.0.24+build5", "latest", "", None, 5])
+def test_parse_refuses_anything_but_major_minor_patch(tag):
+    assert _parse(tag) is None
 
 
 # ── _is_newer ─────────────────────────────────────────────────────────────────
@@ -112,80 +110,6 @@ def test_fetch_latest_returns_none_on_timeout():
 
 # ── SHA256 integrity check ─────────────────────────────────────────────────────
 
-def test_sha256_mismatch_raises_value_error():
-    """InstallerDownloader should raise ValueError when hash does not match."""
-    import hashlib, tempfile, os
-    from updater import InstallerDownloader
-
-    # Write a dummy exe file
-    tmp_dir = tempfile.mkdtemp()
-    exe_path = os.path.join(tmp_dir, "Istari_Setup.exe")
-    with open(exe_path, "wb") as f:
-        f.write(b"fake exe content")
-
-    wrong_hash = "0" * 64  # clearly wrong SHA256
-
-    # Simulate sidecar returning wrong hash
-    sidecar_response = MagicMock()
-    sidecar_response.__enter__ = lambda s: s
-    sidecar_response.__exit__ = MagicMock(return_value=False)
-    sidecar_response.read.return_value = wrong_hash.encode()
-
-    with patch("updater.urllib.request.urlretrieve",
-               side_effect=lambda url, dest, reporthook: open(dest, "wb").write(b"fake exe content")):
-        with patch("updater.urllib.request.urlopen", return_value=sidecar_response):
-            downloader = InstallerDownloader.__new__(InstallerDownloader)
-            downloader._url = "https://example.com/Istari_Setup.exe"
-
-            errors = []
-            downloader.error = MagicMock()
-            downloader.error.emit = lambda msg: errors.append(msg)
-            downloader.finished = MagicMock()
-            downloader.progress = MagicMock()
-            downloader._thread = MagicMock()
-
-            downloader._run()
-
-    assert len(errors) == 1
-    assert "SHA256 mismatch" in errors[0] or "mismatch" in errors[0].lower()
-
-
-def test_sha256_match_succeeds():
-    """InstallerDownloader should emit finished when hash matches."""
-    import tempfile, os
-    from updater import InstallerDownloader
-
-    content = b"valid exe content"
-    correct_hash = hashlib.sha256(content).hexdigest()
-
-    sidecar_response = MagicMock()
-    sidecar_response.__enter__ = lambda s: s
-    sidecar_response.__exit__ = MagicMock(return_value=False)
-    sidecar_response.read.return_value = correct_hash.encode()
-
-    finished_paths = []
-
-    def fake_urlretrieve(url, dest, reporthook=None):
-        with open(dest, "wb") as f:
-            f.write(content)
-
-    with patch("updater.urllib.request.urlretrieve", side_effect=fake_urlretrieve):
-        with patch("updater.urllib.request.urlopen", return_value=sidecar_response):
-            downloader = InstallerDownloader.__new__(InstallerDownloader)
-            downloader._url = "https://example.com/Istari_Setup.exe"
-            downloader.error = MagicMock()
-            downloader.finished = MagicMock()
-            downloader.finished.emit = lambda p: finished_paths.append(p)
-            downloader.progress = MagicMock()
-            downloader.progress.emit = MagicMock()
-            downloader._thread = MagicMock()
-
-            downloader._run()
-
-    assert len(finished_paths) == 1
-    assert finished_paths[0].endswith(".exe")
-
-
 def _stub_downloader(url="https://example.com/Istari_Setup.exe"):
     """InstallerDownloader with its Qt signals and thread replaced by stubs."""
     from updater import InstallerDownloader
@@ -200,6 +124,7 @@ def _stub_downloader(url="https://example.com/Istari_Setup.exe"):
     d.error.emit = errors.append
     d.finished = MagicMock()
     d.finished.emit = finished.append
+    d.cancelled = MagicMock()
     return d, errors, finished
 
 
@@ -270,3 +195,381 @@ def test_unverified_update_error_is_user_friendly():
     )
     assert title == "Update Could Not Be Verified"
     assert "manually" in body
+
+
+# ══ Regression tests: updater hardening (UP-1 … UP-11) ═══════════════════════
+
+import http.server
+import threading
+import time
+
+import updater
+from updater import UpdateChecker, failure_text, _trim_notes, _cleanup_stale_update_dirs
+
+
+def _assert_no_update_dirs(base):
+    left = [n for n in os.listdir(base) if n.startswith("istari_update_")]
+    assert left == [], f"temp update dirs left behind: {left}"
+
+
+# ── UP-1: the app quits only after the installer really started ───────────────
+
+def _installer_in(tmp_path):
+    d = tmp_path / "istari_update_x"
+    d.mkdir()
+    exe = d / "Istari_Setup.exe"
+    exe.write_bytes(b"x")
+    return str(exe)
+
+
+@pytest.fixture
+def install_spy(monkeypatch):
+    spy = MagicMock()
+    spy.scheduled, spy.shown = [], []
+    monkeypatch.setattr(updater.QTimer, "singleShot",
+                        lambda ms, fn: spy.scheduled.append(fn))
+    monkeypatch.setattr(updater, "_show_message",
+                        lambda title, body, parent=None: spy.shown.append((title, body)))
+    return spy
+
+
+@pytest.mark.parametrize("err", [1223, 5])
+def test_failed_or_declined_launch_keeps_the_app_running(monkeypatch, tmp_path, install_spy, err):
+    monkeypatch.setattr(updater, "_launch_installer", lambda path: err)
+    exe, prog, quit_fn = _installer_in(tmp_path), MagicMock(), MagicMock()
+
+    assert updater._start_install(exe, prog, quit_fn) is False
+
+    assert install_spy.scheduled == []            # no quit scheduled
+    quit_fn.assert_not_called()
+    prog.close.assert_called_once()
+    assert len(install_spy.shown) == 1            # the user is told
+    assert ("administrator" in install_spy.shown[0][1]) == (err == 1223)
+    assert not os.path.exists(exe)                # verified-but-unused installer removed
+
+
+def test_started_installer_schedules_the_quit(monkeypatch, tmp_path, install_spy):
+    monkeypatch.setattr(updater, "_launch_installer", lambda path: None)
+    quit_fn = MagicMock()
+
+    assert updater._start_install(_installer_in(tmp_path), MagicMock(), quit_fn) is True
+
+    assert install_spy.scheduled == [quit_fn]
+    assert install_spy.shown == []
+
+
+def test_launch_installer_reports_the_win32_error_when_shellexecute_fails(monkeypatch):
+    import ctypes
+    shell32 = ctypes.windll.shell32
+    monkeypatch.setattr(shell32, "ShellExecuteExW", MagicMock(return_value=False), raising=False)
+    monkeypatch.setattr(ctypes.windll.kernel32, "GetLastError", lambda: 1223, raising=False)
+
+    assert updater._launch_installer(r"C:\x\Istari_Setup.exe") == 1223
+
+
+# ── UP-2 / UP-7 / UP-9: the checker always finishes and always says something ─
+
+def _run_checker(qtbot, monkeypatch, fetch, cfg=None, manual=False):
+    import cfg as cfg_mod
+    monkeypatch.setattr(cfg_mod, "load_cfg", lambda: dict(cfg or {}))
+    monkeypatch.setattr(updater, "_fetch_release", fetch)
+    c = UpdateChecker("o", "r", manual=manual)
+    got = []
+    c.update_available.connect(lambda *a: got.append(("update", a)))
+    c.no_update.connect(lambda: got.append(("none", ())))
+    c.check_failed.connect(lambda msg: got.append(("failed", (msg,))))
+    c.start()
+    qtbot.waitUntil(lambda: not c._thread.isRunning(), timeout=5000)
+    qtbot.wait(50)   # let queued signals land
+    return got
+
+
+@pytest.mark.parametrize("payload", [
+    [],
+    {"tag_name": None, "assets": []},
+    {"tag_name": 5},
+    "string",
+])
+def test_malformed_reply_ends_in_check_failed_and_stops_the_thread(qtbot, monkeypatch, payload):
+    got = _run_checker(qtbot, monkeypatch, lambda o, r: (payload, ""))
+    assert [g[0] for g in got] == ["failed"]
+
+
+def test_assets_null_does_not_crash_the_checker(qtbot, monkeypatch):
+    rel = {"tag_name": "v99.0.0", "assets": None}
+    got = _run_checker(qtbot, monkeypatch, lambda o, r: (rel, ""))
+    assert [g[0] for g in got] == ["none"]
+
+
+def test_exception_inside_the_check_is_reported_not_swallowed(qtbot, monkeypatch):
+    def boom(o, r):
+        raise TypeError("boom")
+    got = _run_checker(qtbot, monkeypatch, boom)
+    assert [g[0] for g in got] == ["failed"]
+
+
+def test_check_failed_still_works_with_a_slot_that_takes_no_argument(qtbot, monkeypatch):
+    """istari.py connects no-argument slots to check_failed."""
+    import cfg as cfg_mod
+    monkeypatch.setattr(cfg_mod, "load_cfg", lambda: {})
+    monkeypatch.setattr(updater, "_fetch_release", lambda o, r: (None, "network"))
+    c = UpdateChecker("o", "r")
+    hits = []
+    c.check_failed.connect(lambda: hits.append(1))
+    c.start()
+    qtbot.waitUntil(lambda: bool(hits), timeout=5000)
+
+
+RELEASE = {"tag_name": "v99.0.0", "body": "notes",
+           "assets": [{"name": "Istari_Setup.exe", "browser_download_url": "https://x/Istari_Setup.exe"}]}
+
+
+def test_manual_check_offers_a_skipped_version(qtbot, monkeypatch):
+    got = _run_checker(qtbot, monkeypatch, lambda o, r: (RELEASE, ""),
+                       cfg={"skipped_version": "v99.0.0"}, manual=True)
+    assert [g[0] for g in got] == ["update"]
+
+
+def test_background_check_still_honours_skip(qtbot, monkeypatch):
+    got = _run_checker(qtbot, monkeypatch, lambda o, r: (RELEASE, ""),
+                       cfg={"skipped_version": "v99.0.0"}, manual=False)
+    assert [g[0] for g in got] == ["none"]
+
+
+def _http_error(code):
+    return urllib.error.HTTPError(url="", code=code, msg="x", hdrs=None, fp=None)
+
+
+@pytest.mark.parametrize("code,reason", [(403, "rate_limit"), (429, "rate_limit"),
+                                         (404, "not_found"), (500, "http")])
+def test_http_errors_get_their_own_reason(code, reason):
+    with patch("updater.urllib.request.urlopen", side_effect=_http_error(code)):
+        assert updater._fetch_release("o", "r") == (None, reason)
+
+
+def test_network_error_reason_and_texts_differ():
+    with patch("updater.urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
+        assert updater._fetch_release("o", "r") == (None, "network")
+    assert "rate limit" in failure_text("rate_limit").lower()
+    assert "connection" in failure_text("network").lower()
+    assert failure_text("rate_limit") != failure_text("network")
+
+
+def test_checker_passes_the_reason_text_to_check_failed(qtbot, monkeypatch):
+    got = _run_checker(qtbot, monkeypatch, lambda o, r: (None, "rate_limit"))
+    assert got == [("failed", (failure_text("rate_limit"),))]
+
+
+# ── UP-8: strict version compare ──────────────────────────────────────────────
+
+@pytest.mark.parametrize("remote,current,expected", [
+    ("v1.0.24.0",     "1.0.24", False),   # four parts: no reinstall loop
+    ("v1.0.25-rc1",   "1.0.25", False),   # release candidate is not newer than final
+    ("v1.0.25-beta",  "1.0.24", False),   # pre-releases are never offered
+    ("v1.0.24+build5", "1.0.24", False),
+    ("2026.11.16",    "1.0.24", True),    # still a valid MAJOR.MINOR.PATCH
+    ("latest",        "1.0.24", False),
+    (None,            "1.0.24", False),
+    ("v1.0.25",       "1.0.24", True),
+    ("v1.0.10",       "1.0.9",  True),    # numeric, not lexical
+])
+def test_is_newer_strict(remote, current, expected):
+    assert _is_newer(remote, current) is expected
+
+
+# ── UP-11: the installer is picked by name ────────────────────────────────────
+
+def test_installer_asset_is_picked_by_name_not_position():
+    release = {"assets": [
+        {"name": "other.exe",        "browser_download_url": "https://x/other.exe"},
+        {"name": "Istari_Setup.exe", "browser_download_url": "https://x/Istari_Setup.exe"},
+    ]}
+    assert _find_installer_asset(release) == "https://x/Istari_Setup.exe"
+
+
+def test_a_lone_foreign_exe_is_not_the_installer():
+    assert _find_installer_asset(
+        {"assets": [{"name": "other.exe", "browser_download_url": "https://x/other.exe"}]}) is None
+
+
+# ── UP-6: corruption is not reported as a missing checksum ────────────────────
+
+def test_hash_mismatch_message_is_not_the_missing_checksum_message():
+    title, body = _friendly_error("SHA256 mismatch: expected a, got b")
+    assert "does not publish" not in body
+    assert "corrupt" in title.lower() or "corrupt" in body.lower()
+    assert _friendly_error("No SHA256 checksum published for this release")[0] == \
+        "Update Could Not Be Verified"
+
+
+def test_tls_hostname_mismatch_is_still_a_secure_connection_error():
+    assert _friendly_error("[SSL: CERTIFICATE_VERIFY_FAILED] Hostname mismatch")[0] == \
+        "Secure Connection Failed"
+
+
+# ── UP-4: timeouts, cleanup, cancel ───────────────────────────────────────────
+
+class _Server:
+    """Local HTTP server: /Istari_Setup.exe behaves per `mode`, .sha256 serves `digest`."""
+
+    def __init__(self, mode, body=b"installer-bytes", digest=None):
+        outer = self
+        self.release = threading.Event()
+        self.body = body
+        self.digest = digest or hashlib.sha256(body).hexdigest()
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                if self.path.endswith(".sha256"):
+                    data = (outer.digest + "  Istari_Setup.exe\n").encode()
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                if mode == "stall":
+                    self.send_response(200)
+                    self.send_header("Content-Length", "1000000")
+                    self.end_headers()
+                    self.wfile.flush()
+                    outer.release.wait(15)
+                elif mode == "truncated":
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(outer.body) + 100))
+                    self.end_headers()
+                    self.wfile.write(outer.body)
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(outer.body)))
+                    self.end_headers()
+                    self.wfile.write(outer.body)
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.httpd.daemon_threads = True
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.httpd.server_port}/Istari_Setup.exe"
+
+    def close(self):
+        self.release.set()
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+@pytest.fixture
+def server(request, tmp_path, monkeypatch):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    made = []
+
+    def make(mode, **kw):
+        s = _Server(mode, **kw)
+        made.append(s)
+        return s
+    yield make
+    for s in made:
+        s.close()
+
+
+def test_stalled_download_times_out_and_leaves_no_temp_dir(server, tmp_path, monkeypatch):
+    monkeypatch.setattr(updater, "DOWNLOAD_TIMEOUT", 1)
+    srv = server("stall")
+    d, errors, finished = _stub_downloader(srv.url)
+
+    t0 = time.monotonic()
+    d._run()
+
+    assert time.monotonic() - t0 < 8
+    assert finished == [] and len(errors) == 1
+    _assert_no_update_dirs(tmp_path)
+
+
+def test_checksum_mismatch_deletes_the_bad_installer(server, tmp_path):
+    srv = server("ok", digest="0" * 64)
+    d, errors, finished = _stub_downloader(srv.url)
+
+    d._run()
+
+    assert finished == []
+    assert len(errors) == 1 and "mismatch" in errors[0].lower()
+    _assert_no_update_dirs(tmp_path)
+
+
+def test_truncated_download_is_an_error_and_cleaned_up(server, tmp_path):
+    srv = server("truncated")
+    d, errors, finished = _stub_downloader(srv.url)
+
+    d._run()
+
+    assert finished == [] and len(errors) == 1
+    _assert_no_update_dirs(tmp_path)
+
+
+def test_verified_download_keeps_only_the_installer(server, tmp_path):
+    srv = server("ok", body=b"good installer")
+    d, errors, finished = _stub_downloader(srv.url)
+
+    d._run()
+
+    assert errors == [] and len(finished) == 1
+    assert open(finished[0], "rb").read() == b"good installer"
+    assert os.listdir(os.path.dirname(finished[0])) == ["Istari_Setup.exe"]   # no .part
+
+
+def test_cancel_stops_the_download_and_cleans_up(server, tmp_path):
+    srv = server("ok")
+    d, errors, finished = _stub_downloader(srv.url)
+    d.cancel()
+
+    d._run()
+
+    assert errors == [] and finished == []
+    d.cancelled.emit.assert_called_once()
+    _assert_no_update_dirs(tmp_path)
+
+
+def test_missing_checksum_downloads_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    d, errors, _ = _stub_downloader()
+    with patch("updater.urllib.request.urlopen", side_effect=_http_error(404)) as uo:
+        d._run()
+    assert len(errors) == 1
+    assert uo.call_count == 1          # only the sidecar was requested
+    _assert_no_update_dirs(tmp_path)
+
+
+def test_stale_update_dirs_from_earlier_runs_are_removed(tmp_path, monkeypatch):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    old, fresh, other = (tmp_path / n for n in ("istari_update_old", "istari_update_new", "keepme"))
+    for d in (old, fresh, other):
+        d.mkdir()
+        (d / "f").write_bytes(b"x")
+    two_hours_ago = time.time() - 7200
+    os.utime(old, (two_hours_ago, two_hours_ago))
+    os.utime(other, (two_hours_ago, two_hours_ago))
+
+    _cleanup_stale_update_dirs()
+
+    assert not old.exists()
+    assert fresh.exists()       # may still hold a running installer
+    assert other.exists()       # not ours
+
+
+# ── UP-10: release notes are rendered as markdown ─────────────────────────────
+
+def test_release_notes_label_uses_markdown(qtbot):
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtWidgets import QLabel
+    dlg = updater.UpdateDialog("v9.9.9", "## What's Changed\n* **fix** a thing")
+    qtbot.addWidget(dlg)
+    lbl = next(l for l in dlg.findChildren(QLabel) if l.objectName() == "notes_label")
+    assert lbl.textFormat() == Qt.TextFormat.MarkdownText
+
+
+def test_trim_notes_cuts_on_a_boundary():
+    text = "word " * 200
+    out = _trim_notes(text)
+    assert out.endswith("…") and len(out) <= 321
+    assert not out[:-1].endswith("wor")
+    assert _trim_notes("short") == "short"
