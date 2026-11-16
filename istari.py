@@ -10,7 +10,7 @@ from PyQt6.QtCore import (
     Qt, QPoint, QRectF, QTimer, QPropertyAnimation, QEasingCurve, QThread,
     QParallelAnimationGroup,
 )
-from PyQt6.QtGui  import QIcon, QPainter, QPainterPath, QPen, QColor, QFont, QRegion
+from PyQt6.QtGui  import QGuiApplication, QIcon, QPainter, QPainterPath, QPen, QColor, QFont, QRegion
 
 import crash_handler
 crash_handler.install()
@@ -18,7 +18,7 @@ crash_handler.install()
 from logger import get_logger, LOG_DIR
 _log = get_logger("istari")
 
-from hw      import get_data, HardwareWorker
+from hw      import get_data, HardwareWorker, set_ping_target
 from updater import UpdateChecker, prompt_and_install
 from themes  import is_high_contrast, THEMES, make_widget_css, build_menu_css
 from dialogs import WelcomeDialog, SettingsDialog
@@ -31,7 +31,14 @@ from cfg import (
     load_cfg, save_cfg, eff_color, default_color,
     active_sensor_defs,
     is_startup_enabled, set_startup, purge_dead_legacy_startup,
+    is_first_run as _cfg_is_first_run,
 )
+
+
+def _detect_first_run() -> bool:
+    """True when no settings exist (after the legacy migration has run)."""
+    return _cfg_is_first_run()
+
 
 
 
@@ -61,21 +68,32 @@ class Istari(QWidget):
 
         self._build()
 
+        self.adjustSize()
+        saved = self._saved_pos()
         if self.cfg.get("anchor"):
-            self.adjustSize()
-            self._apply_anchor()
-        elif self.cfg["pos_x"] >= 0:
-            x, y = self.cfg["pos_x"], self.cfg["pos_y"]
-            cx, cy = x + self.width() // 2, y + self.height() // 2
+            # Pick the monitor from the saved position, not from the unset
+            # default, so a pinned overlay stays on its own monitor.
+            self._apply_anchor(ref=saved)
+        elif saved is not None:
+            cx, cy = saved.x() + self.width() // 2, saved.y() + self.height() // 2
             if any(s.geometry().contains(cx, cy) for s in QApplication.screens()):
-                self.move(x, y)
+                self.move(saved)
             else:
-                scr = QApplication.primaryScreen().availableGeometry()
-                self.move(scr.width() - self.width() - 20, 20)
+                self.move(self._default_pos())
         else:
-            scr = QApplication.primaryScreen().geometry()
-            self.adjustSize()
-            self.move(scr.width() - self.width() - 20, 20)
+            self.move(self._default_pos())
+
+        # Monitor hot-plug / resolution / taskbar changes: re-snap or re-clamp.
+        gapp = QGuiApplication.instance()
+        gapp.screenAdded.connect(self._on_screens_changed)
+        gapp.screenRemoved.connect(self._on_screens_changed)
+        for scr in QApplication.screens():
+            scr.availableGeometryChanged.connect(self._on_screens_changed)
+        gapp.screenAdded.connect(
+            lambda scr: scr.availableGeometryChanged.connect(self._on_screens_changed))
+        gapp.aboutToQuit.connect(self._stop_worker)
+
+        set_ping_target(self.cfg.get("ping_target"))
 
         # ── Background hardware worker (non-blocking) ──────────────────────────
         self._hw_worker = HardwareWorker(
@@ -103,6 +121,52 @@ class Istari(QWidget):
 
         # ── Background update check (30s delay — don't slow down startup) ──────
         QTimer.singleShot(30_000, self._check_for_updates)
+
+    # ── Position helpers ──────────────────────────────────────────────────────
+    def _saved_pos(self):
+        """Saved overlay position, or None when never saved.
+
+        (-1, -1) is the "unset" marker; any other pair — including negative
+        coordinates, which monitors left of / above the primary use — is real.
+        """
+        x, y = self.cfg.get("pos_x", -1), self.cfg.get("pos_y", -1)
+        if (x, y) == (-1, -1):
+            return None
+        return QPoint(x, y)
+
+    def _default_pos(self, scr=None):
+        """Top-right corner of the work area of `scr` (default: primary)."""
+        a = (scr or QApplication.primaryScreen()).availableGeometry()
+        return QPoint(a.x() + a.width() - self.width() - 20, a.y() + 20)
+
+    def _on_screens_changed(self, *_):
+        """A monitor, resolution or work area changed — keep the overlay reachable."""
+        if self._sliding or self._quitting:
+            return
+        if self.cfg.get("anchor"):
+            self._apply_anchor()
+            return
+        if self.isVisible():
+            self.move(self._clamp_to_screens(self.pos()))
+        elif self._home_pos is not None:
+            self._home_pos = self._clamp_to_screens(self._home_pos)
+
+    def _clamp_to_screens(self, pos):
+        """`pos` moved into the work area of the screen holding the overlay's centre."""
+        w, h = self.width(), self.height()
+        c = QPoint(pos.x() + w // 2, pos.y() + h // 2)
+        scr = QApplication.screenAt(c)
+        if scr is None:
+            for s in QApplication.screens():
+                if s.geometry().contains(c):
+                    scr = s
+                    break
+        if scr is None:
+            return self._default_pos()
+        a = scr.availableGeometry()
+        x = max(a.x(), min(pos.x(), a.x() + a.width() - w))
+        y = max(a.y(), min(pos.y(), a.y() + a.height() - h))
+        return QPoint(x, y)
 
     # ── System tray ───────────────────────────────────────────────────────────
     def _setup_tray(self):
@@ -149,15 +213,23 @@ class Istari(QWidget):
         if getattr(self, "_updater_running", False):
             return   # already checking
         self._updater_running = True
-        self._updater = UpdateChecker(_GITHUB_OWNER, _GITHUB_REPO, parent=self)
+        # Keep every checker alive until its thread has finished: replacing
+        # the only reference mid-thread destroys a running QThread.
+        refs = [u for u in getattr(self, "_updater_refs", [])
+                if getattr(getattr(u, "_thread", None), "isRunning", lambda: False)()]
+        self._updater = UpdateChecker(_GITHUB_OWNER, _GITHUB_REPO, manual=manual)
+        refs.append(self._updater)
+        self._updater_refs = refs
         self._updater.update_available.connect(
             lambda tag, url, notes: self._on_update_available(tag, url, notes)
         )
         if manual:
             self._updater.no_update.connect(self._on_no_update)
-            self._updater.check_failed.connect(self._on_check_failed)
+        self._updater.check_failed.connect(
+            lambda reason: self._on_check_failed(reason, manual)
+        )
         self._updater.no_update.connect(lambda: setattr(self, "_updater_running", False))
-        self._updater.check_failed.connect(lambda: setattr(self, "_updater_running", False))
+        self._updater.check_failed.connect(lambda *_: setattr(self, "_updater_running", False))
         self._updater.update_available.connect(lambda *_: setattr(self, "_updater_running", False))
         self._updater.start()
 
@@ -172,15 +244,20 @@ class Istari(QWidget):
             3000,
         )
 
-    def _on_check_failed(self) -> None:
+    def _on_check_failed(self, reason: str = "", manual: bool = True) -> None:
+        _log.warning("Update check failed (%s): %s", "manual" if manual else "automatic", reason)
+        if not manual:
+            return   # automatic checks never pop up
         self._tray.showMessage(
             "Istari",
-            "Could not reach the update server. Check your connection.",
+            reason or "Could not reach the update server. Check your connection.",
             QSystemTrayIcon.MessageIcon.Warning,
             4000,
         )
 
     def _quit(self):
+        if self._quitting:
+            return   # a second Quit click must not schedule a second shutdown
         _log.info("Istari shutting down.")
         self._quitting = True
         if self.isVisible():
@@ -188,10 +265,18 @@ class Istari(QWidget):
         else:
             self._actual_quit()
 
-    def _actual_quit(self):
+    def _stop_worker(self):
+        """Stop the sensor thread once; log if it does not finish in time."""
+        if getattr(self, "_worker_stopped", False):
+            return
+        self._worker_stopped = True
         self._hw_worker.stop()
         self._hw_thread.quit()
-        self._hw_thread.wait(2000)
+        if not self._hw_thread.wait(2000):
+            _log.warning("Hardware worker thread did not stop within 2s — exiting anyway.")
+
+    def _actual_quit(self):
+        self._stop_worker()
         self._tray.hide()
         QApplication.instance().quit()
 
@@ -227,7 +312,7 @@ class Istari(QWidget):
             self._toggle_overlay()
 
     def _toggle_overlay(self):
-        if self._sliding:
+        if self._sliding or self._quitting:
             return
         if self.isVisible():
             self._home_pos = self.pos()
@@ -276,14 +361,12 @@ class Istari(QWidget):
 
     def _slide_in(self):
         self._sliding = True
-        _target_pos = self._home_pos or (
-            QPoint(self.cfg["pos_x"], self.cfg["pos_y"]) if self.cfg.get("pos_x", -1) >= 0 else None
-        )
+        _target_pos = self._home_pos or self._saved_pos()
         scr = (
             (QApplication.screenAt(_target_pos) if _target_pos else None)
             or QApplication.primaryScreen()
         ).availableGeometry()
-        target = _target_pos if _target_pos is not None else QPoint(scr.width() - self.width() - 20, 20)
+        target = _target_pos if _target_pos is not None else self._default_pos()
         self.move(target.x(), scr.bottom() + self.height())
         self.show()
         anim = QPropertyAnimation(self, b"pos")
@@ -349,12 +432,20 @@ class Istari(QWidget):
         ("Bottom Right",  "br"),
     ]
 
-    def _apply_anchor(self, save: bool = False):
-        """Snap the widget to the configured screen-edge preset."""
+    def _apply_anchor(self, save: bool = False, ref=None):
+        """Snap the widget to the configured screen-edge preset.
+
+        `ref` is a top-left position that selects the monitor (startup: the
+        saved position). A tray-hidden window sits off-screen, so its home
+        position stands in for it.
+        """
         a = self.cfg.get("anchor", "")
         if not a:
             return
-        scr = (QApplication.screenAt(self.pos())
+        if ref is None:
+            ref = self.pos() if self.isVisible() or self._home_pos is None else self._home_pos
+        ref_c = QPoint(ref.x() + self.width() // 2, ref.y() + self.height() // 2)
+        scr = (QApplication.screenAt(ref_c)
                or QApplication.primaryScreen()).availableGeometry()
         m = 16
         w, h = self.width(), self.height()
@@ -436,6 +527,7 @@ class Istari(QWidget):
         self._clear_layout()
         self._cells.clear()
         self._prev_vals.clear()
+        self._last_src = None   # the new card's source label starts at "connecting..."
         # Card-only widgets — None in bar mode
         self._title_lbl = None
         self._src_lbl   = None
@@ -657,12 +749,23 @@ class Istari(QWidget):
             if self._gap3:
                 self._gap3.setFixedHeight(self._s(4))
 
+    def _dialog_screen(self):
+        """Work area of the monitor the overlay is on (dialogs open there)."""
+        scr = None
+        if not self.isVisible() and self._home_pos is not None:
+            # Tray-hidden: the window is parked off its monitor; use its home.
+            scr = QApplication.screenAt(QPoint(self._home_pos.x() + self.width() // 2,
+                                               self._home_pos.y() + self.height() // 2))
+        scr = scr or self.screen() or QApplication.primaryScreen()
+        return scr.availableGeometry()
+
     # ── Settings ──────────────────────────────────────────────────────────────
     def _open_settings(self):
         old_layout = self.cfg.get("layout", "card")
+        old_top = self.cfg.get("always_on_top", True)
         dlg = SettingsDialog(self.cfg, self)
         dlg.adjustSize()
-        screen = QApplication.primaryScreen().availableGeometry()
+        screen = self._dialog_screen()
         dlg.move(
             screen.x() + (screen.width()  - dlg.width())  // 2,
             screen.y() + (screen.height() - dlg.height()) // 2,
@@ -672,6 +775,7 @@ class Istari(QWidget):
             self._apply_widget_css()
             self.setWindowOpacity(self.cfg["opacity"] / 100)
             self._hw_worker.set_interval(self.cfg["update_ms"])
+            set_ping_target(self.cfg.get("ping_target"))
             self._hw_worker.set_sensors(active_sensor_defs(self.cfg))
             if layout_changed:
                 self._build()
@@ -680,8 +784,17 @@ class Istari(QWidget):
                 self._rebuild_sensors()
                 self._apply_colors()
                 self._apply_theme()
-            self._apply_window_flags()
-            self.show()
+            # Rebuilt cells read "---" until the next poll (up to 5 s): refill them.
+            last = getattr(self, "_last_payload", None)
+            if last:
+                self._on_data(*last, _replay=True)
+            if self.cfg.get("always_on_top", True) != old_top:
+                was_visible = self.isVisible()
+                self._apply_window_flags()
+                # Stay hidden if the overlay is tray-hidden: show() would put
+                # it on screen at its off-screen slide-out position.
+                if was_visible:
+                    self.show()
             # setWindowFlags() recreates the native window — WS_EX_NOACTIVATE
             # must be re-applied or the overlay starts stealing focus from games.
             self._apply_no_activate()
@@ -732,8 +845,14 @@ class Istari(QWidget):
         elif action == act_quit: self._quit()
 
     def closeEvent(self, e):
-        """Ignore external close requests — only _quit() may close the overlay."""
-        if getattr(self, '_quitting', False):
+        """Ignore stray window-system close requests (WM_CLOSE / Alt+F4).
+
+        Programmatic closes — QApplication.quit(), Windows logoff/shutdown —
+        are not spontaneous and must go through, or the overlay blocks the
+        session from ending.
+        """
+        if (getattr(self, '_quitting', False) or not e.spontaneous()
+                or QGuiApplication.instance().isSavingSession()):
             e.accept()
         else:
             e.ignore()
@@ -772,13 +891,17 @@ class Istari(QWidget):
         self._drag_pos = QPoint()
 
     # ── Data slot (called from HardwareWorker signal, UI thread via Qt signal) ──
-    def _on_data(self, data: dict, maxes: dict, src: str):
+    def _on_data(self, data: dict, maxes: dict, src: str, _replay: bool = False):
         try:
+            if not _replay:
+                self._last_payload = (data, maxes, src)
             if src != self._last_src:
                 if self._src_lbl:
                     self._src_lbl.setText(src)
                 self._last_src = src
             for key, (row_w, dot, val_lbl, bar_fill, bar_w, unit, bar_max, desc) in self._cells.items():
+                if _replay and key not in data:
+                    continue   # sensor added since the last poll — wait for real data
                 v = data.get(key)
                 if v is None:
                     text, w = "  N/A", 0
@@ -902,6 +1025,16 @@ def _icon_path():
     return os.path.join(base, "istari.ico")
 
 
+def _refresh_startup_entry() -> None:
+    """Re-write our autostart entry if enabled; log the real outcome."""
+    if not is_startup_enabled():
+        return
+    if set_startup(True):
+        _log.info("Startup registry entry refreshed.")
+    else:
+        _log.warning("Startup registry entry could not be refreshed.")
+
+
 if __name__ == "__main__":
     import ctypes as _ct
 
@@ -935,16 +1068,14 @@ if __name__ == "__main__":
     if os.path.exists(ico):
         app.setWindowIcon(QIcon(ico))
 
-    is_first_run = not os.path.exists(SETTINGS_FILE)
+    is_first_run = _detect_first_run()
 
     # ── Startup registry: keep our own entry fresh, drop the pre-rename one ───
     # The old build registered "Palantir" pointing at a path the rename removed;
     # nothing else ever cleans it up.
     if purge_dead_legacy_startup():
         _log.info("Legacy 'Palantir' startup entry removed.")
-    if is_startup_enabled():
-        set_startup(True)
-        _log.info("Startup registry entry refreshed.")
+    _refresh_startup_entry()
 
     w = Istari()
     w._apply_no_activate()
@@ -952,7 +1083,7 @@ if __name__ == "__main__":
 
     def _show_welcome():
         dlg = WelcomeDialog(w)
-        screen = QApplication.primaryScreen().availableGeometry()
+        screen = w._dialog_screen()
         dlg.move(
             screen.x() + (screen.width()  - dlg.width())  // 2,
             screen.y() + (screen.height() - dlg.height()) // 2,

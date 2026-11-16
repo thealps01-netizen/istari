@@ -8,7 +8,7 @@
 [Setup]
 AppName={#AppName}
 AppVersion={#AppVersion}
-AppPublisher=Muhammed Enes Alpler
+AppPublisher=thealps01-netizen
 AppPublisherURL=https://github.com/thealps01-netizen/istari
 AppSupportURL=https://github.com/thealps01-netizen/istari/issues
 AppUpdatesURL=https://github.com/thealps01-netizen/istari/releases
@@ -21,7 +21,7 @@ RestartApplications=no
 VersionInfoVersion={#AppVersion}.0
 VersionInfoDescription={#AppName} Setup
 VersionInfoProductName={#AppName}
-VersionInfoCompany=Muhammed Enes Alpler
+VersionInfoCompany=thealps01-netizen
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
@@ -34,6 +34,9 @@ UninstallDisplayName={#AppName}
 UninstallDisplayIcon={app}\istari.ico
 SetupIconFile=istari.ico
 PrivilegesRequired=admin
+; Created only by the elevated Setup process; the updater polls it to learn that the
+; UAC prompt was accepted (updater.SETUP_MUTEX).
+SetupMutex=IstariSetupMutex
 MinVersion=10.0
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -54,10 +57,19 @@ Name: "{group}\Uninstall {#AppName}";    Filename: "{uninstallexe}"
 Name: "{userdesktop}\{#AppName}";        Filename: "{app}\{#AppExe}"; IconFilename: "{app}\istari.ico"; Tasks: desktopicon
 
 [Run]
+; The installer runs elevated (PrivilegesRequired=admin: Setup elevates itself; the
+; updater starts it unelevated on purpose, because runasoriginaluser has no effect when
+; Setup is launched from an already-elevated process). runasoriginaluser starts the app with the logged-in user's token instead,
+; so the overlay is never left running as administrator (istari.manifest: asInvoker).
 ; Interactive install — user can choose to launch from the wizard
-Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 ; Silent install (auto-update) — restart app automatically after install completes
-Filename: "{app}\{#AppExe}"; Flags: nowait; Check: WizardSilent
+Filename: "{app}\{#AppExe}"; Flags: nowait runasoriginaluser; Check: WizardSilent
+
+[Registry]
+; The app writes this value itself (cfg.py, "start with Windows"); remove it on uninstall
+; so no dangling startup entry is left behind.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: "Istari"; Flags: uninsdeletevalue dontcreatekey
 
 [UninstallRun]
 ; Force-kill the app before uninstaller tries to delete the exe

@@ -4,7 +4,7 @@ Also provides HardwareWorker — a QThread-based poller that emits sensor data
 on a configurable interval without blocking the UI thread.
 """
 
-import ctypes, math, socket, time
+import ctypes, math, re, socket, time
 from logger import get_logger
 
 _log = get_logger("hw")
@@ -56,6 +56,7 @@ class _Entry(ctypes.LittleEndianStructure):
 
 # ── Pre-computed sizes, kernel32 setup (once at import) ───────────────────────
 _HDR_SIZE   = ctypes.sizeof(_Hdr)
+_MIN_HDR_SIZE = 24   # MAHM v1.x header: signature .. time (no GPU fields)
 _ENTRY_SIZE = ctypes.sizeof(_Entry)
 
 _mahm_sensor_count: int = 0   # tracks last reported count to avoid log spam
@@ -65,6 +66,61 @@ _k32.OpenFileMappingW.restype  = ctypes.c_void_p
 _k32.MapViewOfFile.restype     = ctypes.c_void_p
 _k32.UnmapViewOfFile.argtypes  = [ctypes.c_void_p]
 _k32.CloseHandle.argtypes      = [ctypes.c_void_p]
+_k32.GetTickCount.restype      = ctypes.c_uint32
+_k32.VirtualQuery.argtypes     = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+_k32.VirtualQuery.restype      = ctypes.c_size_t
+_u32 = ctypes.windll.user32
+_u32.GetForegroundWindow.restype      = ctypes.c_void_p
+_u32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+_u32.GetWindowThreadProcessId.restype  = ctypes.c_uint32
+
+# v1.x MAHM entries (no gpu / src_id fields) are 12 bytes shorter than v2.0.
+_MIN_ENTRY_SIZE = _ENTRY_SIZE - 12
+
+# Problems seen on every poll are logged once, then again after a good read.
+_warned: set = set()
+
+
+def _warn_once(key: str, msg: str, *args) -> None:
+    if key not in _warned:
+        _warned.add(key)
+        _log.warning(msg, *args)
+
+
+class _MemInfo(ctypes.Structure):
+    """MEMORY_BASIC_INFORMATION (64-bit layout, with PartitionId)."""
+    _fields_ = [
+        ("BaseAddress",       ctypes.c_void_p),
+        ("AllocationBase",    ctypes.c_void_p),
+        ("AllocationProtect", ctypes.c_uint32),
+        ("PartitionId",       ctypes.c_uint16),
+        ("RegionSize",        ctypes.c_size_t),
+        ("State",             ctypes.c_uint32),
+        ("Protect",           ctypes.c_uint32),
+        ("Type",              ctypes.c_uint32),
+    ]
+
+
+def _view_size(pv) -> int:
+    """Bytes mapped at `pv` (0 when the query fails)."""
+    mi = _MemInfo()
+    if _k32.VirtualQuery(pv, ctypes.byref(mi), ctypes.sizeof(mi)) == 0:
+        return 0
+    return int(mi.RegionSize)
+
+
+def _foreground_pid() -> int:
+    """PID of the foreground window's process (0 when unknown)."""
+    try:
+        hwnd = _u32.GetForegroundWindow()
+        if not hwnd:
+            return 0
+        pid = ctypes.c_uint32(0)
+        _u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return int(pid.value)
+    except Exception as e:
+        _log.debug("Foreground PID unavailable (%s: %s)", type(e).__name__, e)
+        return 0
 
 
 def _usable_max(value: float, limit: float) -> float | None:
@@ -82,6 +138,62 @@ def _usable_max(value: float, limit: float) -> float | None:
     return limit
 
 
+def _parse_mahm(pv: int, size: int) -> dict:
+    """Parse a MAHM view of `size` mapped bytes starting at address `pv`.
+
+    Every read is bounded by `size`: a header that claims more entries than
+    the view holds, or v1.x entries 12 bytes shorter than ours, must not read
+    past the end of the mapping (an access violation is a hard crash).
+    """
+    if size < _HDR_SIZE:
+        _warn_once("mahm-size", "MAHM view is only %d bytes — ignoring it", size)
+        return {}
+    # Local buffers — read_mahm() is called from both the worker thread and
+    # the UI thread (Settings dialog); shared module-level buffers would race.
+    _hdr_buf   = (ctypes.c_byte * _HDR_SIZE)()
+    _entry_buf = (ctypes.c_byte * _ENTRY_SIZE)()
+    ctypes.memmove(_hdr_buf, pv, _HDR_SIZE)
+    hdr = _Hdr.from_buffer(_hdr_buf)
+    if hdr.sig != MAHM_SIG:
+        _log.debug("MAHM signature mismatch — Afterburner not running?")
+        return {}
+    num    = hdr.num
+    hdr_sz = hdr.headerSize or _HDR_SIZE
+    sz     = hdr.entrySize  or _ENTRY_SIZE
+    if num > 512 or sz < _MIN_ENTRY_SIZE or sz > 8192 or hdr_sz < _MIN_HDR_SIZE or hdr_sz > size:
+        _warn_once("mahm-header", "MAHM header sanity check failed (num=%d, hdr=%d, sz=%d, view=%d)",
+                   num, hdr_sz, sz, size)
+        return {}
+    fits = (size - hdr_sz) // sz
+    if num > fits:
+        _warn_once("mahm-trunc", "MAHM header claims %d entries but the view holds %d — "
+                   "reading %d", num, fits, fits)
+        num = fits
+    _warned.difference_update(("mahm-size", "mahm-header"))
+    copy_n = min(sz, _ENTRY_SIZE)
+    out = {}
+    for i in range(num):
+        try:
+            ctypes.memset(_entry_buf, 0, _ENTRY_SIZE)   # no stale tail from the last entry
+            ctypes.memmove(_entry_buf, pv + hdr_sz + i * sz, copy_n)
+            e = _Entry.from_buffer(_entry_buf)
+            n = e.srcName.decode("utf-8", errors="ignore").rstrip("\x00").lower()
+            if n:
+                v = e.data
+                if math.isfinite(v) and v < 3.4e38:
+                    out[n] = (v, _usable_max(v, e.max_limit))
+        except Exception as e:
+            _log.warning("MAHM entry %d unreadable (%s: %s) — returning the %d sensor(s) "
+                         "read so far", i, type(e).__name__, e, len(out))
+            break
+    if out:
+        global _mahm_sensor_count
+        if len(out) != _mahm_sensor_count:
+            _mahm_sensor_count = len(out)
+            _log.info("MAHM connected — %d sensors available", len(out))
+    return out
+
+
 def read_mahm() -> dict:
     hm = _k32.OpenFileMappingW(FILE_MAP_READ, False, "MAHMSharedMemory")
     if not hm:
@@ -91,41 +203,7 @@ def read_mahm() -> dict:
         _k32.CloseHandle(hm)
         return {}
     try:
-        # Local buffers — read_mahm() is called from both the worker thread and
-        # the UI thread (Settings dialog); shared module-level buffers would race.
-        _hdr_buf   = (ctypes.c_byte * _HDR_SIZE)()
-        _entry_buf = (ctypes.c_byte * _ENTRY_SIZE)()
-        ctypes.memmove(_hdr_buf, pv, _HDR_SIZE)
-        hdr = _Hdr.from_buffer(_hdr_buf)
-        if hdr.sig != MAHM_SIG:
-            _log.debug("MAHM signature mismatch — Afterburner not running?")
-            return {}
-        num    = hdr.num
-        hdr_sz = hdr.headerSize or _HDR_SIZE
-        sz     = hdr.entrySize  or _ENTRY_SIZE
-        if num > 512 or sz < 100 or sz > 8192:
-            _log.warning("MAHM header sanity check failed (num=%d, sz=%d)", num, sz)
-            return {}
-        out = {}
-        for i in range(num):
-            try:
-                ctypes.memmove(_entry_buf, pv + hdr_sz + i * sz, _ENTRY_SIZE)
-                e = _Entry.from_buffer(_entry_buf)
-                n = e.srcName.decode("utf-8", errors="ignore").rstrip("\x00").lower()
-                if n:
-                    v = e.data
-                    if math.isfinite(v) and v < 3.4e38:
-                        out[n] = (v, _usable_max(v, e.max_limit))
-            except Exception as e:
-                _log.warning("MAHM entry %d unreadable (%s: %s) — returning the %d sensor(s) "
-                             "read so far", i, type(e).__name__, e, len(out))
-                break
-        if out:
-            global _mahm_sensor_count
-            if len(out) != _mahm_sensor_count:
-                _mahm_sensor_count = len(out)
-                _log.info("MAHM connected — %d sensors available", len(out))
-        return out
+        return _parse_mahm(pv, _view_size(pv))
     except Exception as e:
         _log.error("MAHM read error: %s", e)
         return {}
@@ -182,11 +260,59 @@ _RTSS_HDR_SIZE = ctypes.sizeof(_RtssHdr)
 _RTSS_APP_SIZE = ctypes.sizeof(_RtssAppEntry)
 
 
+def _parse_rtss(pv: int, size: int, now: int, fg_pid: int) -> float | None:
+    """FPS of the live hooked app in an RTSS view of `size` bytes.
+
+    Prefers the app whose PID is `fg_pid` (the game in front); otherwise the
+    most recently updated one. Reads stay inside the `size` mapped bytes.
+    """
+    if size < _RTSS_HDR_SIZE:
+        return None
+    hdr_buf = (ctypes.c_byte * _RTSS_HDR_SIZE)()
+    ctypes.memmove(hdr_buf, pv, _RTSS_HDR_SIZE)
+    hdr = _RtssHdr.from_buffer(hdr_buf)
+    if hdr.dwSignature != RTSS_SIG or hdr.dwVersion < 0x00020000:
+        return None
+    n_apps     = hdr.dwAppArrSize
+    entry_size = hdr.dwAppEntrySize
+    # RTSS 7.3.x uses 12416-byte app entries; allow generous headroom.
+    if n_apps > 256 or entry_size < _RTSS_APP_SIZE or entry_size > 65536:
+        return None
+    if hdr.dwAppArrOffset > size:
+        return None
+    n_apps = min(n_apps, (size - hdr.dwAppArrOffset) // entry_size)
+    # dwTime0/dwTime1 are in GetTickCount() milliseconds — only entries
+    # updated within the last few seconds are live (RTSS keeps stale slots
+    # around for idle apps that rendered a frame long ago).
+    mask = 0xFFFFFFFF
+    best:    tuple | None = None   # (age, fps) of the most recent live app
+    best_fg: tuple | None = None   # same, restricted to the foreground PID
+    ebuf = (ctypes.c_byte * _RTSS_APP_SIZE)()
+    for i in range(n_apps):
+        ctypes.memmove(ebuf, pv + hdr.dwAppArrOffset + i * entry_size, _RTSS_APP_SIZE)
+        e = _RtssAppEntry.from_buffer(ebuf)
+        if not e.dwProcessID:
+            continue
+        age = (now - e.dwTime1) & mask             # tick-count wraparound safe
+        if age > 3000:
+            continue
+        dt = (e.dwTime1 - e.dwTime0) & mask        # wraps like the age above
+        if dt > 0 and e.dwFrames > 0:
+            fps = e.dwFrames * 1000.0 / dt
+            if 1 < fps < 2000:
+                if best is None or age <= best[0]:
+                    best = (age, fps)
+                if fg_pid and e.dwProcessID == fg_pid and (best_fg is None or age <= best_fg[0]):
+                    best_fg = (age, fps)
+    pick = best_fg or best
+    return pick[1] if pick else None
+
+
 def read_rtss_fps() -> float | None:
     """Read current framerate directly from RTSS shared memory.
 
-    Returns FPS of the most recently updated hooked 3D app, or None when
-    RTSS is not running / no app is hooked.
+    Returns FPS of the hooked 3D app in the foreground, else of the most
+    recently updated one, or None when RTSS is not running / no app is hooked.
     """
     hm = _k32.OpenFileMappingW(FILE_MAP_READ, False, "RTSSSharedMemoryV2")
     if not hm:
@@ -196,38 +322,7 @@ def read_rtss_fps() -> float | None:
         _k32.CloseHandle(hm)
         return None
     try:
-        hdr_buf = (ctypes.c_byte * _RTSS_HDR_SIZE)()
-        ctypes.memmove(hdr_buf, pv, _RTSS_HDR_SIZE)
-        hdr = _RtssHdr.from_buffer(hdr_buf)
-        if hdr.dwSignature != RTSS_SIG or hdr.dwVersion < 0x00020000:
-            return None
-        n_apps     = hdr.dwAppArrSize
-        entry_size = hdr.dwAppEntrySize
-        # RTSS 7.3.x uses 12416-byte app entries; allow generous headroom.
-        if n_apps > 256 or entry_size < _RTSS_APP_SIZE or entry_size > 65536:
-            return None
-        # dwTime0/dwTime1 are in GetTickCount() milliseconds — only entries
-        # updated within the last few seconds are live (RTSS keeps stale slots
-        # around for idle apps that rendered a frame long ago).
-        now = _k32.GetTickCount()
-        best_fps:  float | None = None
-        best_time: int          = 0
-        ebuf = (ctypes.c_byte * _RTSS_APP_SIZE)()
-        for i in range(n_apps):
-            ctypes.memmove(ebuf, pv + hdr.dwAppArrOffset + i * entry_size, _RTSS_APP_SIZE)
-            e = _RtssAppEntry.from_buffer(ebuf)
-            if not e.dwProcessID:
-                continue
-            age = (now - e.dwTime1) & 0xFFFFFFFF   # tick-count wraparound safe
-            if age > 3000:
-                continue
-            dt = e.dwTime1 - e.dwTime0
-            if dt > 0 and e.dwFrames > 0:
-                fps = e.dwFrames * 1000.0 / dt
-                if e.dwTime1 >= best_time and 1 < fps < 2000:
-                    best_time = e.dwTime1
-                    best_fps  = fps
-        return best_fps
+        return _parse_rtss(pv, _view_size(pv), _k32.GetTickCount(), _foreground_pid())
     except Exception as e:
         _log.debug("RTSS read error: %s", e)
         return None
@@ -266,26 +361,59 @@ _ping_cache:  float | None       = None
 _ping_thread: "_threading.Thread | None" = None
 
 
+DEFAULT_PING_TARGET = ("1.1.1.1", 53)
+_ping_target: tuple = DEFAULT_PING_TARGET
+_ping_ok: "bool | None" = None   # last probe outcome for the current target
+
+
+def set_ping_target(spec) -> None:
+    """Set the probe target from a 'host:port' string (cfg 'ping_target').
+
+    An invalid spec keeps the default and is logged.
+    """
+    global _ping_target, _ping_ok, _ping_cache
+    from cfg import parse_ping_target
+    target = parse_ping_target(spec) or DEFAULT_PING_TARGET
+    if parse_ping_target(spec) is None:
+        _log.warning("Invalid ping target %r — using %s:%d", spec, *DEFAULT_PING_TARGET)
+    with _ping_lock:
+        if target != _ping_target:
+            _ping_target, _ping_ok, _ping_cache = target, None, None
+
+
 def _ping_worker(host: str, port: int, timeout: float) -> None:
-    global _ping_cache
+    global _ping_cache, _ping_ok
+    err = None
     try:
         t0 = time.perf_counter()
         with socket.create_connection((host, port), timeout=timeout):
             pass
         result = round((time.perf_counter() - t0) * 1000)
-    except Exception:
-        result = None
+    except Exception as e:
+        result, err = None, e
     with _ping_lock:
-        _ping_cache = result
+        if (host, port) == _ping_target:
+            _ping_cache = result
+            # Log state changes only: a poll every second would flood the log.
+            if err is not None and _ping_ok is not False:
+                _log.warning("Ping probe to %s:%d failed (%s: %s) — PING will show N/A "
+                             "until it recovers", host, port, type(err).__name__, err)
+            elif err is None and _ping_ok is False:
+                _log.info("Ping probe to %s:%d recovered", host, port)
+            _ping_ok = err is None
     global _ping_thread
     _ping_thread = None
 
 
-def get_ping_ms(host: str = "1.1.1.1", port: int = 53, timeout: float = 2.0) -> float | None:
+def get_ping_ms(host: "str | None" = None, port: "int | None" = None,
+                timeout: float = 2.0) -> float | None:
     """Return cached round-trip latency in ms; fires a background update each call."""
     global _ping_thread
     with _ping_lock:
         cached = _ping_cache
+        th, tp = _ping_target
+    host = th if host is None else host
+    port = tp if port is None else port
     # Fire a new probe only when no probe is already running
     if _ping_thread is None or not _ping_thread.is_alive():
         t = _threading.Thread(target=_ping_worker, args=(host, port, timeout), daemon=True)
@@ -302,6 +430,9 @@ _WIN_FALLBACKS = {
 
 
 # ── Sensor pick helpers ───────────────────────────────────────────────────────
+_STAT_RE = re.compile(r"\b(?:low|min|avg|max)\b")
+
+
 def _pick_sensor(raw: dict, candidates: tuple) -> tuple[float | None, float | None]:
     """Return (current_val, bar_scale) for the first matching candidate.
 
@@ -319,6 +450,10 @@ def _pick_sensor(raw: dict, candidates: tuple) -> tuple[float | None, float | No
     for c in candidates:
         for k, tup in raw.items():
             if c in k:
+                # "framerate 1% low" / "... avg" are statistics of the sensor,
+                # not the sensor: only a candidate that names them may bind them.
+                if _STAT_RE.search(k) and not _STAT_RE.search(c):
+                    continue
                 return tup
     return (None, None)
 
@@ -399,7 +534,9 @@ try:
             super().__init__()
             self._sensors     = sensors
             self._interval_ms = interval_ms
-            self._running     = False
+            # True from construction: a stop() issued before the thread reaches
+            # run() must not be overwritten.
+            self._running     = True
 
         def set_sensors(self, sensors: list) -> None:
             self._sensors = sensors
@@ -408,7 +545,6 @@ try:
             self._interval_ms = interval_ms
 
         def run(self) -> None:
-            self._running = True
             _log.debug("HardwareWorker started (interval=%dms)", self._interval_ms)
             while self._running:
                 try:

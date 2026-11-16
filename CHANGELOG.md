@@ -6,6 +6,42 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **No administrator rights after an update.** After an automatic update Istari now restarts
+  with normal (non-administrator) rights instead of as administrator.
+- **Updates no longer take the app down with them.** If the installer is declined at the UAC
+  prompt or fails to start, Istari says so and keeps running instead of quitting. The update
+  check always finishes. A failed manual check now says why (rate limit, server error, no
+  connection) instead of always blaming the connection, and a manual check offers a version you
+  skipped earlier. Failed automatic checks stay quiet. Downloads have a timeout, can be
+  cancelled and clean up after themselves, and a checksum mismatch is reported as a mismatch.
+- **Settings are safer.** A file that cannot be read is kept instead of renamed away, and one bad
+  value in a hand-edited file no longer wipes the rest. Users upgrading from the old "Palantir"
+  build keep their settings and no longer see the Welcome dialog again. The ping target is
+  configurable (`ping_target`, `host:port`) and applies at startup and when you press Apply.
+- **Settings dialog.** Cancel after Default, or after adding or removing a sensor, no longer
+  changes your live settings. A failed save keeps the dialog open and tells you. The dialog fits
+  small screens, opens on the overlay's monitor, works in High Contrast mode and tabs in reading
+  order. Text and borders meet WCAG AA contrast in every theme.
+- **Overlay.** Positions left of the primary monitor are remembered, the overlay follows monitor
+  and taskbar changes, applying Settings while the overlay is hidden in the tray no longer shows
+  it off-screen, and quitting is no longer cut short.
+- **Sensors.** FPS follows the game in the foreground and no longer binds to "1% low" style
+  statistics. Sensor reads stay inside the mapped memory, so a malformed block cannot crash the app.
+- **Crashes and logs.** The crash dialog appears once, on the UI thread, and crash files no longer
+  overwrite each other. A locked or unwritable log folder no longer stops the app or silences logging.
+- **Installer and release.** Auto-updates restart Istari without administrator rights, the
+  uninstaller removes the startup entry, and release builds are tested, pinned and checked against
+  the tag before publishing.
+
+### Changed
+- The test suite runs against a temporary data folder and fails any test that writes the real
+  registry without faking it, so running it no longer touches your logs or startup entry.
+
+---
+
 ## [1.0.24] — 2026-09-18
 
 ### Fixed

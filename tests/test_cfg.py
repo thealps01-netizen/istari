@@ -275,6 +275,7 @@ def test_purge_dead_legacy_startup_removes_entry_with_missing_target(tmp_path, m
     monkeypatch.setattr(cfg, "_query_startup_value",
                         lambda name: f'"{tmp_path / "gone" / "Palantir.exe"}"')
     monkeypatch.setattr(cfg, "_delete_startup_value", deleted.append)
+    monkeypatch.setattr(cfg, "set_startup", lambda on: True)
 
     assert cfg.purge_dead_legacy_startup() is True
     assert deleted == [cfg._LEGACY_APP_NAME]
@@ -342,3 +343,294 @@ def test_set_startup_reports_true_when_removal_succeeded(monkeypatch):
     monkeypatch.setattr(cfg, "_query_startup_value", lambda name: None)
 
     assert cfg.set_startup(False) is True
+
+
+
+# ── CFG-1: only parse errors quarantine the file ──────────────────────────────
+
+def test_cfg1_unreadable_file_is_kept_and_not_overwritten(tmp_settings, monkeypatch):
+    tmp_settings.write_text(json.dumps({"scale": 150}))
+    real_open = open
+
+    def locked(path, *a, **k):
+        if str(path) == str(tmp_settings):
+            raise PermissionError("sharing violation")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr("builtins.open", locked)
+    result = cfg.load_cfg()
+    assert result["scale"] == 100                       # defaults this session
+    assert tmp_settings.exists()                        # not renamed away
+    assert not list(tmp_settings.parent.glob("*.corrupt_*"))
+    assert cfg.save_cfg(result) is False                # and not overwritten with defaults
+    monkeypatch.setattr("builtins.open", real_open)
+    assert json.loads(tmp_settings.read_text())["scale"] == 150
+    # R-CFG-1: still blocked once the file is readable again (session-sticky)
+    assert cfg.save_cfg(result) is False
+    assert json.loads(tmp_settings.read_text())["scale"] == 150
+
+
+# ── CFG-2: BOM + per-field sanitizing ─────────────────────────────────────────
+
+def test_cfg2_utf8_bom_file_loads(tmp_settings):
+    tmp_settings.write_bytes(b"\xef\xbb\xbf" + json.dumps({"scale": 150}).encode())
+    assert cfg.load_cfg()["scale"] == 150
+    assert not list(tmp_settings.parent.glob("*.corrupt_*"))
+
+
+def test_cfg2_infinity_field_keeps_other_fields(tmp_settings):
+    tmp_settings.write_text('{"scale":150,"pos_x":Infinity}')
+    r = cfg.load_cfg()
+    assert r["scale"] == 150 and r["pos_x"] == -1
+    assert not list(tmp_settings.parent.glob("*.corrupt_*"))
+
+
+def test_cfg2_unhashable_sensor_item_keeps_other_fields(tmp_settings):
+    tmp_settings.write_text(json.dumps({"scale": 150, "active_sensors": [["x"], "fps"]}))
+    r = cfg.load_cfg()
+    assert r["scale"] == 150 and r["active_sensors"] == ["fps"]
+
+
+def test_cfg2_non_bool_flags_fall_back_per_field(tmp_settings):
+    tmp_settings.write_text(json.dumps({"scale": 150, "locked": "false", "skipped_version": 3}))
+    r = cfg.load_cfg()
+    assert r["scale"] == 150 and r["locked"] is False and r["skipped_version"] == ""
+
+
+# ── CFG-3: legacy autostart is carried over ───────────────────────────────────
+
+def test_cfg3_purging_legacy_startup_enables_istari_entry(tmp_path, monkeypatch):
+    enabled = []
+    monkeypatch.setattr(cfg, "_query_startup_value",
+                        lambda name: f'"{tmp_path / "gone" / "Palantir.exe"}"')
+    monkeypatch.setattr(cfg, "_delete_startup_value", lambda name: None)
+    monkeypatch.setattr(cfg, "set_startup", lambda on: enabled.append(on) or True)
+
+    assert cfg.purge_dead_legacy_startup() is True
+    assert enabled == [True]
+
+
+def test_cfg3_kept_legacy_entry_does_not_touch_istari_entry(tmp_path, monkeypatch):
+    exe = tmp_path / "Palantir.exe"
+    exe.write_text("x")
+    enabled = []
+    monkeypatch.setattr(cfg, "_query_startup_value", lambda name: f'"{exe}"')
+    monkeypatch.setattr(cfg, "set_startup", lambda on: enabled.append(on) or True)
+
+    assert cfg.purge_dead_legacy_startup() is False
+    assert enabled == []
+
+
+# ── CFG-4: adopted legacy settings are not a first run ────────────────────────
+
+def test_cfg4_is_first_run_false_after_legacy_adoption(tmp_settings, tmp_path):
+    legacy = tmp_path / "Palantir" / "settings.json"
+    legacy.parent.mkdir()
+    legacy.write_text(json.dumps({"opacity": 95}))
+    assert cfg.is_first_run() is False
+    assert tmp_settings.exists()
+
+
+def test_cfg4_is_first_run_true_without_any_settings(tmp_settings):
+    assert cfg.is_first_run() is True
+
+
+# ── CFG-5: save_cfg result, durability, atomic legacy copy ────────────────────
+
+def test_cfg5_save_returns_true_on_success(tmp_settings):
+    assert cfg.save_cfg(cfg.default_cfg()) is True
+
+
+def test_cfg5_save_returns_false_when_replace_fails(tmp_settings, monkeypatch):
+    def boom(*_a):
+        raise PermissionError("locked")
+    monkeypatch.setattr(os, "replace", boom)
+    assert cfg.save_cfg(cfg.default_cfg()) is False
+    assert not os.path.exists(str(tmp_settings) + ".tmp")
+
+
+def test_cfg5_save_fsyncs_before_replace(tmp_settings, monkeypatch):
+    order = []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(os, "fsync", lambda fd: (order.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(os, "replace", lambda a, b: (order.append("replace"), real_replace(a, b))[1])
+    assert cfg.save_cfg(cfg.default_cfg()) is True
+    assert order == ["fsync", "replace"]
+
+
+def test_cfg5_legacy_copy_goes_through_temp_file(tmp_settings, tmp_path, monkeypatch):
+    legacy = tmp_path / "Palantir" / "settings.json"
+    legacy.parent.mkdir()
+    legacy.write_text(json.dumps({"opacity": 95}))
+    seen = []
+    real_replace = os.replace
+    monkeypatch.setattr(os, "replace", lambda a, b: (seen.append((a, b)), real_replace(a, b))[1])
+    assert cfg._migrate_legacy_settings() is True
+    assert seen == [(str(tmp_settings) + ".tmp", str(tmp_settings))]
+
+
+# ── CFG-6: schema version, unknown keys, newer files ──────────────────────────
+
+def test_cfg6_save_writes_schema(tmp_settings):
+    cfg.save_cfg(cfg.default_cfg())
+    assert json.loads(tmp_settings.read_text())["schema"] == cfg.SCHEMA_VERSION
+
+
+def test_cfg6_unknown_keys_survive_a_round_trip(tmp_settings):
+    tmp_settings.write_text(json.dumps({"opacity": 70, "future_key": {"a": 1}}))
+    loaded = cfg.load_cfg()
+    assert cfg.save_cfg(loaded) is True
+    saved = json.loads(tmp_settings.read_text())
+    assert saved["future_key"] == {"a": 1} and saved["opacity"] == 70
+
+
+def test_cfg6_newer_schema_is_not_overwritten(tmp_settings):
+    text = json.dumps({"schema": cfg.SCHEMA_VERSION + 1, "opacity": 70, "new_thing": 1})
+    tmp_settings.write_text(text)
+    loaded = cfg.load_cfg()
+    assert loaded["opacity"] == 70                 # recognised fields still load
+    assert cfg.save_cfg(loaded) is False
+    assert tmp_settings.read_text() == text
+    assert not list(tmp_settings.parent.glob("*.corrupt_*"))
+
+
+# ── CFG-7: active_sensors / visible normalised ────────────────────────────────
+
+def test_cfg7_duplicates_removed_in_order(tmp_settings):
+    tmp_settings.write_text(json.dumps({"active_sensors": ["fps", "fps", "cpu_temp", "fps"]}))
+    assert cfg.load_cfg()["active_sensors"] == ["fps", "cpu_temp"]
+
+
+def test_cfg7_visible_accepts_only_real_bools(tmp_settings):
+    tmp_settings.write_text(json.dumps(
+        {"active_sensors": ["fps", "cpu_temp"], "visible": {"fps": "false", "cpu_temp": False}}))
+    vis = cfg.load_cfg()["visible"]
+    assert vis == {"fps": True, "cpu_temp": False}
+
+
+# ── HW-5 settings key: ping_target ────────────────────────────────────────────
+
+@pytest.mark.parametrize("spec,expected", [
+    ("1.1.1.1:53", ("1.1.1.1", 53)),
+    (" game-server.example.com:27015 ", ("game-server.example.com", 27015)),
+    ("1.1.1.1", None), ("host:0", None), ("host:70000", None),
+    ("ho st:80", None), (":80", None), (5, None), ("host:port", None),
+])
+def test_parse_ping_target(spec, expected):
+    assert cfg.parse_ping_target(spec) == expected
+
+
+def test_ping_target_default_and_validation(tmp_settings):
+    assert cfg.load_cfg()["ping_target"] == "1.1.1.1:53"
+    tmp_settings.write_text(json.dumps({"ping_target": "8.8.8.8:443"}))
+    assert cfg.load_cfg()["ping_target"] == "8.8.8.8:443"
+    tmp_settings.write_text(json.dumps({"ping_target": "nonsense", "scale": 150}))
+    r = cfg.load_cfg()
+    assert r["ping_target"] == "1.1.1.1:53" and r["scale"] == 150
+
+
+# -- R-CFG-1: an unreadable file stays protected for the whole session ---------
+
+def _lock(monkeypatch, path):
+    real_open = open
+
+    def locked(p, *a, **k):
+        if str(p) == str(path):
+            raise PermissionError("sharing violation")
+        return real_open(p, *a, **k)
+    monkeypatch.setattr("builtins.open", locked)
+    return real_open
+
+
+def test_rcfg1_unreadable_stays_blocked_after_unlock_and_reload(tmp_settings, monkeypatch):
+    tmp_settings.write_text(json.dumps({"scale": 150}))
+    real_open = _lock(monkeypatch, tmp_settings)
+    defaults = cfg.load_cfg()
+    monkeypatch.setattr("builtins.open", real_open)       # file is readable again
+
+    cfg.load_cfg()                                         # e.g. the updater thread
+    assert cfg.save_cfg(defaults) is False
+    assert json.loads(tmp_settings.read_text())["scale"] == 150
+
+
+def test_rcfg1_newer_schema_block_survives_a_concurrent_load(tmp_settings, monkeypatch):
+    tmp_settings.write_text(json.dumps({"scale": 150, "schema": cfg.SCHEMA_VERSION + 1}))
+    loaded = cfg.load_cfg()
+    seen = []
+    real_migrate = cfg._migrate_legacy_settings
+
+    def racing_migrate():
+        seen.append(cfg.save_cfg(loaded))     # a save lands mid-way through another load
+        return real_migrate()
+    monkeypatch.setattr(cfg, "_migrate_legacy_settings", racing_migrate)
+    cfg.load_cfg()
+    assert seen == [False]
+    assert json.loads(tmp_settings.read_text())["scale"] == 150
+
+
+# -- R-CFG-2: absurdly nested JSON is quarantined, not a crash -----------------
+
+def test_rcfg2_deeply_nested_json_is_quarantined(tmp_settings):
+    tmp_settings.write_text("[" * 200_000)
+    r = cfg.load_cfg()
+    assert r["scale"] == 100
+    assert list(tmp_settings.parent.glob("settings.json.corrupt_*"))
+
+
+# ── R2-2: only the startup load may set the sticky unreadable block ───────────
+
+def test_r2_2_read_only_load_never_blocks_saves(tmp_settings, monkeypatch):
+    tmp_settings.write_text(json.dumps({"scale": 150}))
+    live = cfg.load_cfg()                                  # good startup load
+    real_open = _lock(monkeypatch, tmp_settings)
+    assert cfg.load_cfg(read_only=True) is None            # transient lock: reported, not defaults
+    monkeypatch.setattr("builtins.open", real_open)
+    assert cfg.save_cfg(live) is True                      # the live settings can still be saved
+
+
+def test_r2_2_read_only_load_returns_the_settings(tmp_settings):
+    tmp_settings.write_text(json.dumps({"scale": 150, "skipped_version": "v9"}))
+    got = cfg.load_cfg(read_only=True)
+    assert got["scale"] == 150 and got["skipped_version"] == "v9"
+
+
+def test_r2_2_read_only_load_keeps_the_newer_schema_block(tmp_settings):
+    tmp_settings.write_text(json.dumps({"scale": 150, "schema": cfg.SCHEMA_VERSION + 1}))
+    got = cfg.load_cfg(read_only=True)
+    assert got["scale"] == 150
+    assert cfg.save_cfg(got) is False
+    assert json.loads(tmp_settings.read_text())["scale"] == 150
+
+
+# ── R2-3: restore the exact previous startup value ────────────────────────────
+
+def test_r2_3_restore_startup_value_writes_the_exact_string(monkeypatch):
+    written = []
+    monkeypatch.setattr(cfg.winreg, "OpenKey", lambda *a, **k: _FakeKey())
+    monkeypatch.setattr(cfg.winreg, "SetValueEx",
+                        lambda key, name, reserved, kind, value: written.append((name, value)))
+    monkeypatch.setattr(cfg.winreg, "CloseKey", lambda key: None)
+    monkeypatch.setattr(cfg, "_query_startup_value", lambda name: '"C:/old/Istari.exe" --x')
+    assert cfg.restore_startup_value('"C:/old/Istari.exe" --x') is True
+    assert written == [("Istari", '"C:/old/Istari.exe" --x')]
+
+
+def test_r2_3_restore_startup_value_none_removes_the_entry(monkeypatch):
+    deleted = []
+    monkeypatch.setattr(cfg.winreg, "OpenKey", lambda *a, **k: _FakeKey())
+    monkeypatch.setattr(cfg.winreg, "DeleteValue", lambda key, name: deleted.append(name))
+    monkeypatch.setattr(cfg.winreg, "CloseKey", lambda key: None)
+    monkeypatch.setattr(cfg, "_query_startup_value", lambda name: None)
+    assert cfg.restore_startup_value(None) is True
+    assert deleted == ["Istari"]
+
+
+# ── R3-2: a read-only load never renames or writes anything ───────────────────
+
+@pytest.mark.parametrize("content", [b"{not json", b"[1, 2]", b"\xff\xfe\x00bad", b"[" * 100000],
+                         ids=["bad-json", "non-object", "bad-utf8", "deep-nesting"])
+def test_r3_2_read_only_load_leaves_a_corrupt_file_alone(tmp_settings, content):
+    tmp_settings.write_bytes(content)
+    assert cfg.load_cfg(read_only=True) is None
+    assert tmp_settings.read_bytes() == content
+    assert [p.name for p in tmp_settings.parent.iterdir()] == ["settings.json"]
