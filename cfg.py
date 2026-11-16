@@ -102,7 +102,8 @@ def purge_dead_legacy_startup() -> bool:
     After the rename that value pointed at C:\\Program Files\\Palantir\\Palantir.exe
     and nothing ever touched it again, so Windows kept trying to start a path
     that no longer exists. Only removed when the target file is missing — an old
-    install still on disk keeps its entry. Returns True when it was removed.
+    install still on disk keeps its entry. When it is removed, Istari's own
+    autostart entry is enabled in its place. Returns True when it was removed.
     """
     cmd = _query_startup_value(_LEGACY_APP_NAME)
     if not cmd:
@@ -116,6 +117,13 @@ def purge_dead_legacy_startup() -> bool:
         return False
     _delete_startup_value(_LEGACY_APP_NAME)
     _log.info("Removed stale '%s' startup entry (%s)", _LEGACY_APP_NAME, cmd)
+    # The user had autostart under the old name and the installer registers
+    # none: carry it over, or the upgrade silently turns autostart off.
+    if set_startup(True):
+        _log.info("Autostart carried over to '%s'.", _APP_NAME)
+    else:
+        _log.warning("Could not carry the autostart over to '%s' — the user must "
+                     "re-enable it in Settings.", _APP_NAME)
     return True
 
 
@@ -125,7 +133,11 @@ _DIR = os.path.join(_LOCALAPPDATA, "Istari")
 # Directory the pre-rename build wrote to; only its settings.json is adopted
 # (logs and install files stay where they are).
 _LEGACY_DIR = os.path.join(_LOCALAPPDATA, "Palantir")
-os.makedirs(_DIR, exist_ok=True)
+try:
+    os.makedirs(_DIR, exist_ok=True)
+except OSError as _e:
+    # load_cfg/save_cfg report the real failure; do not kill the import.
+    _log.error("Could not create the settings directory %s (%s)", _DIR, _e)
 
 SETTINGS_FILE        = os.path.join(_DIR, "settings.json")
 LEGACY_SETTINGS_FILE = os.path.join(_LEGACY_DIR, "settings.json")
@@ -165,7 +177,14 @@ _DEFAULT_ACTIVE = ["fps", "gpu_usage", "gpu_temp", "cpu_usage", "cpu_temp", "ram
 # Screen anchor presets: "" = free (drag), others snap to screen edges
 ANCHOR_PRESETS = ("", "tl", "tc", "tr", "bl", "bc", "br")
 
+# Version of the settings file layout. Bump when a change needs a migration.
+# A file with a larger number was written by a newer build and is left alone.
+SCHEMA_VERSION = 1
+
+DEFAULT_PING_TARGET = "1.1.1.1:53"
+
 DEFAULT_CFG = {
+    "schema":          SCHEMA_VERSION,
     "opacity":         90,
     "hover_opacity":   20,
     "update_ms":       1000,
@@ -181,30 +200,43 @@ DEFAULT_CFG = {
     "visible":         {k: True for k in _DEFAULT_ACTIVE},
     "colors":          {},
     "skipped_version": "",
+    "ping_target":     DEFAULT_PING_TARGET,
 }
 
 
 # ── Settings validation ───────────────────────────────────────────────────────
-_HEX_RE = re.compile(r'^#[0-9a-fA-F]{6}$')
+_HEX_RE  = re.compile(r'^#[0-9a-fA-F]{6}$')
+_HOST_RE = re.compile(r'^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$')
+
+
+def parse_ping_target(spec) -> "tuple[str, int] | None":
+    """Parse 'host:port' into (host, port); None when it is not a valid target."""
+    if not isinstance(spec, str):
+        return None
+    host, sep, port = spec.strip().rpartition(":")
+    if not sep or not _HOST_RE.match(host) or not port.isdigit():
+        return None
+    port = int(port)
+    return (host, port) if 1 <= port <= 65535 else None
 
 
 def _sanitize_cfg(cfg: dict) -> dict:
-    """Clamp/coerce every scalar field so bad values in settings.json can't crash the app."""
+    """Clamp/coerce every field so bad values in settings.json can't crash the app.
+
+    Each field is validated on its own: a bad value costs that field only.
+    """
     def clamp_int(v, lo, hi, default):
         try:
             v = int(v)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):   # OverflowError: int(inf)
             return default
         return max(lo, min(hi, v))
-
-    def valid_color(v, default):
-        return v if isinstance(v, str) and _HEX_RE.match(v) else default
 
     def snap_ms(v):
         opts = [500, 1000, 2000, 5000]
         try:
             v = int(v)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return DEFAULT_CFG["update_ms"]
         return min(opts, key=lambda x: abs(x - v))
 
@@ -212,21 +244,32 @@ def _sanitize_cfg(cfg: dict) -> dict:
         """Field value, falling back to its default instead of raising KeyError."""
         return cfg.get(key, DEFAULT_CFG[key])
 
+    def boolean(key):
+        v = get(key)
+        return v if isinstance(v, bool) else DEFAULT_CFG[key]
+
     cfg["opacity"]       = clamp_int(get("opacity"),       20,  100, DEFAULT_CFG["opacity"])
     cfg["hover_opacity"] = clamp_int(get("hover_opacity"),  5,   80, DEFAULT_CFG["hover_opacity"])
     cfg["scale"]         = clamp_int(get("scale"),          60,  200, DEFAULT_CFG["scale"])
     cfg["update_ms"]     = snap_ms(get("update_ms"))
-    cfg["locked"]        = bool(get("locked"))
-    cfg["always_on_top"] = bool(get("always_on_top"))
-    try:
-        cfg["pos_x"] = int(get("pos_x"))
-        cfg["pos_y"] = int(get("pos_y"))
-    except (TypeError, ValueError):
-        cfg["pos_x"] = DEFAULT_CFG["pos_x"]
-        cfg["pos_y"] = DEFAULT_CFG["pos_y"]
+    cfg["locked"]        = boolean("locked")
+    cfg["always_on_top"] = boolean("always_on_top")
+    cfg["pos_x"] = clamp_int(get("pos_x"), -10**6, 10**6, DEFAULT_CFG["pos_x"])
+    cfg["pos_y"] = clamp_int(get("pos_y"), -10**6, 10**6, DEFAULT_CFG["pos_y"])
     cfg["anchor"] = get("anchor") if get("anchor") in ANCHOR_PRESETS else ""
     cfg["theme"] = get("theme") if get("theme") in ("dark", "light") else "dark"
     cfg["layout"] = get("layout") if get("layout") in ("card", "bar") else "card"
+    sv = get("skipped_version")
+    cfg["skipped_version"] = sv if isinstance(sv, str) else ""
+    pt = get("ping_target")
+    target = parse_ping_target(pt)
+    if target is None:
+        if "ping_target" in cfg:
+            _log.warning("settings.json 'ping_target' %r is not host:port — using %s.",
+                         pt, DEFAULT_PING_TARGET)
+        cfg["ping_target"] = DEFAULT_PING_TARGET
+    else:
+        cfg["ping_target"] = f"{target[0]}:{target[1]}"
     saved_colors = get("colors")
     if not isinstance(saved_colors, dict):
         # A wrong type here used to raise out of _sanitize_cfg and take every
@@ -238,6 +281,20 @@ def _sanitize_cfg(cfg: dict) -> dict:
         k: v for k, v in saved_colors.items()
         if k in SENSOR_CATALOG and isinstance(v, str) and _HEX_RE.match(v)
     }
+    # active_sensors: known keys only, no duplicates, original order.
+    active = get("active_sensors")
+    if not isinstance(active, list):
+        active = list(_DEFAULT_ACTIVE)
+    seen = []
+    for k in active:
+        if isinstance(k, str) and k in SENSOR_CATALOG and k not in seen:
+            seen.append(k)
+    cfg["active_sensors"] = seen
+    # visible: one real bool per active sensor, True when not (validly) saved.
+    vis = get("visible")
+    vis = vis if isinstance(vis, dict) else {}
+    cfg["visible"] = {k: (vis[k] if isinstance(vis.get(k), bool) else True) for k in seen}
+    cfg["schema"] = SCHEMA_VERSION
     return cfg
 
 
@@ -261,74 +318,117 @@ def _migrate_legacy_settings() -> bool:
     """
     if os.path.exists(SETTINGS_FILE) or not os.path.exists(LEGACY_SETTINGS_FILE):
         return False
+    tmp = SETTINGS_FILE + ".tmp"
     try:
         with open(LEGACY_SETTINGS_FILE, "rb") as src:
             data = src.read()
-        with open(SETTINGS_FILE, "wb") as dst:
-            dst.write(data)
+        _write_atomic(tmp, SETTINGS_FILE, data)   # a kill mid-copy leaves no partial file
     except OSError as e:
         _log.warning("Could not migrate legacy settings from %s: %s",
                      LEGACY_SETTINGS_FILE, e)
+        _remove_quietly(tmp)
         return False
     _log.info("Migrated pre-rename settings from %s", LEGACY_SETTINGS_FILE)
     return True
 
 
 # ── Load / save ───────────────────────────────────────────────────────────────
+# Why save_cfg must not write: None, "unreadable" (the file exists but could not
+# be read — the in-memory settings are only defaults) or "newer" (written by a
+# newer build). Either way the file on disk holds settings we must not clobber.
+_save_block: "str | None" = None
+
+
+def _remove_quietly(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        _log.warning("Could not remove %s (%s)", path, e)
+
+
+def _write_atomic(tmp: str, dest: str, data: bytes) -> None:
+    """Write `data` to `tmp`, flush it to disk, then replace `dest` with it."""
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())   # else a power loss can leave a zero-length file
+    os.replace(tmp, dest)
+
+
+def is_first_run() -> bool:
+    """True when there are no settings to adopt or load.
+
+    Runs the legacy (pre-rename) migration first, so an upgraded user who just
+    had their settings adopted is not shown the first-run welcome dialog.
+    """
+    _migrate_legacy_settings()
+    return not os.path.exists(SETTINGS_FILE)
+
+
 def load_cfg():
+    global _save_block
+    _save_block = None
     _migrate_legacy_settings()
     try:
-        with open(SETTINGS_FILE) as f:
+        # utf-8-sig: Notepad writes a BOM, which plain utf-8 json.load rejects.
+        with open(SETTINGS_FILE, encoding="utf-8-sig") as f:
             saved = json.load(f)
         if not isinstance(saved, dict):
             raise ValueError(f"root is {type(saved).__name__}, expected an object")
-        cfg = default_cfg()
-        # Scalar fields
-        for k in ("opacity", "hover_opacity", "update_ms", "locked",
-                  "always_on_top", "pos_x", "pos_y", "anchor", "theme", "scale",
-                  "layout", "skipped_version"):
-            if k in saved:
-                cfg[k] = saved[k]
-
-        saved_colors = saved.get("colors")
-        cfg["colors"] = saved_colors if isinstance(saved_colors, dict) else {}
-
-        # Container fields: a wrong type must degrade to the default for that
-        # field only — never abort the load and discard everything else.
-        saved_vis     = saved.get("visible")
-        saved_vis     = saved_vis if isinstance(saved_vis, dict) else {}
-        saved_active  = saved.get("active_sensors")
-
-        # active_sensors — new field; derive from old "visible" if absent
-        if isinstance(saved_active, list):
-            cfg["active_sensors"] = [
-                k for k in saved_active if k in SENSOR_CATALOG
-            ]
-        else:
-            derived = [k for k in SENSOR_CATALOG if saved_vis.get(k, False)]
-            cfg["active_sensors"] = derived if derived else list(_DEFAULT_ACTIVE)
-
-        # visible: only keys in active_sensors; default True if not saved
-        cfg["visible"] = {
-            k: saved_vis.get(k, True) for k in cfg["active_sensors"]
-        }
-        cfg = _sanitize_cfg(cfg)
-        _log.info("Settings loaded from %s", SETTINGS_FILE)
-        return cfg
     except FileNotFoundError:
         _log.info("No settings file found, using defaults.")
         return default_cfg()
-    except json.JSONDecodeError as e:
+    except OSError as e:
+        # Locked by antivirus/backup/sync, or a permissions problem: the file
+        # may be perfectly good, so it stays where it is and is not overwritten.
+        _log.error("Could not read settings (%s: %s) — using defaults for this "
+                   "session; the file is left untouched.", type(e).__name__, e)
+        _save_block = "unreadable"
+        return default_cfg()
+    except ValueError as e:   # JSONDecodeError, UnicodeDecodeError, non-object root
         _log.warning("Settings file corrupted (%s), using defaults.", e)
         _backup_corrupt_settings()
         return default_cfg()
+
+    try:
+        raw_schema = saved.get("schema", 0)
+        schema = raw_schema if isinstance(raw_schema, int) and not isinstance(raw_schema, bool) else 0
+        if schema > SCHEMA_VERSION:
+            _save_block = "newer"
+            _log.warning("settings.json has schema %d, newer than the %d this build "
+                         "understands — loading what is recognised and leaving the "
+                         "file unchanged.", schema, SCHEMA_VERSION)
+        cfg = default_cfg()
+        # Unknown keys ride along untouched so a rollback / newer build keeps them.
+        for k, v in saved.items():
+            if k not in DEFAULT_CFG:
+                cfg[k] = v
+        for k in DEFAULT_CFG:
+            if k in saved and k not in ("active_sensors", "visible"):
+                cfg[k] = saved[k]
+
+        # Container fields: a wrong type must degrade to the default for that
+        # field only — never abort the load and discard everything else.
+        saved_vis    = saved.get("visible")
+        saved_vis    = saved_vis if isinstance(saved_vis, dict) else {}
+        saved_active = saved.get("active_sensors")
+        if isinstance(saved_active, list):
+            cfg["active_sensors"] = saved_active
+        else:
+            # Pre-active_sensors files only had "visible".
+            derived = [k for k in SENSOR_CATALOG if saved_vis.get(k) is True]
+            cfg["active_sensors"] = derived if derived else list(_DEFAULT_ACTIVE)
+        cfg["visible"] = saved_vis
+        cfg = _sanitize_cfg(cfg)
+        _log.info("Settings loaded from %s", SETTINGS_FILE)
+        return cfg
     except Exception as e:
-        # Any other read/parse/validation failure: keep the user's file as a
-        # backup, because the next save_cfg would otherwise overwrite it with
-        # defaults and the original settings would be gone for good.
-        _log.error("Failed to load settings (%s: %s), using defaults.",
-                   type(e).__name__, e)
-        _backup_corrupt_settings()
+        # A bug, not bad data: keep the file as it is rather than renaming it.
+        _log.exception("Failed to apply settings (%s: %s), using defaults.",
+                       type(e).__name__, e)
+        _save_block = _save_block or "unreadable"
         return default_cfg()
 
 
@@ -340,28 +440,47 @@ def _backup_corrupt_settings():
     try:
         os.rename(SETTINGS_FILE, backup)
         _log.warning("Corrupt settings backed up to %s", backup)
-    except Exception:
-        pass
+    except OSError as e:
+        _log.error("Could not back up corrupt settings to %s (%s: %s) — the next save "
+                   "will overwrite them.", backup, type(e).__name__, e)
 
 
-def save_cfg(cfg):
-    """Atomically write cfg to SETTINGS_FILE (write-then-rename pattern)."""
+def save_cfg(cfg) -> bool:
+    """Atomically write cfg to SETTINGS_FILE (write, fsync, replace).
+
+    Returns True only when the file was written and replaced; False (and a log
+    line) on any failure or when saving would clobber a file we could not read
+    or that a newer build wrote.
+    """
+    global _save_block
+    if _save_block == "unreadable":
+        # The load failed, so cfg may be plain defaults. Overwrite only once the
+        # file is readable again — otherwise the user's real settings are lost.
+        try:
+            with open(SETTINGS_FILE, "rb") as f:
+                f.read(1)
+        except FileNotFoundError:
+            _save_block = None
+        except OSError as e:
+            _log.error("Settings not saved: %s is still unreadable (%s: %s).",
+                       SETTINGS_FILE, type(e).__name__, e)
+            return False
+        else:
+            _save_block = None
+    if _save_block == "newer":
+        _log.error("Settings not saved: %s was written by a newer build.", SETTINGS_FILE)
+        return False
     tmp = SETTINGS_FILE + ".tmp"
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
-        # Atomic replace — avoids partial writes corrupting the file
-        if os.path.exists(SETTINGS_FILE):
-            os.replace(tmp, SETTINGS_FILE)
-        else:
-            os.rename(tmp, SETTINGS_FILE)
+        data = json.dumps({**cfg, "schema": SCHEMA_VERSION}, indent=2).encode("utf-8")
+        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+        _write_atomic(tmp, SETTINGS_FILE, data)
         _log.debug("Settings saved.")
+        return True
     except Exception as e:
         _log.error("Failed to save settings: %s", e)
-        try:
-            os.remove(tmp)
-        except Exception:
-            pass
+        _remove_quietly(tmp)
+        return False
 
 
 # ── Active sensor helpers ─────────────────────────────────────────────────────
