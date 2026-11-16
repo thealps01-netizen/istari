@@ -393,3 +393,23 @@ def test_sensor_hint_is_a_sentence(dialogs, cfg):
     dlg = dialogs.SettingsDialog(cfg)
     assert dlg._hint_lbl.text() == "Click a dot to change its color"
     dlg.close()
+
+
+def test_rui1_failed_save_restores_the_startup_entry(dialogs, cfg, monkeypatch):
+    state = {"on": False}
+    calls = []
+
+    def set_startup(enabled):
+        calls.append(enabled)
+        state["on"] = enabled
+        return True
+    monkeypatch.setattr(dialogs, "set_startup", set_startup)
+    monkeypatch.setattr(dialogs, "is_startup_enabled", lambda: state["on"])
+    monkeypatch.setattr(dialogs, "save_cfg", lambda c: False)
+    dlg = dialogs.SettingsDialog(cfg)
+    dlg.chk_startup.setChecked(True)
+    dlg._apply()
+    assert calls == [True, False]
+    assert state["on"] is False
+    assert dlg.chk_startup.isChecked() is False
+    assert dlg._error_lbl.text()

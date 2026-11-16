@@ -16,7 +16,8 @@ from cfg import (
     save_cfg, default_color,
     is_startup_enabled, set_startup,
 )
-from logger import LOG_FILE
+from logger import LOG_FILE, get_logger
+_log = get_logger("istari.dialogs")
 
 _FONT = "'Bahnschrift','Segoe UI'"
 _SCREEN_MARGIN = 24      # space kept free around a dialog that had to be shrunk
@@ -725,7 +726,8 @@ class SettingsDialog(QDialog):
     def _apply(self):
         self._show_error("")
         want_startup = self.chk_startup.isChecked()
-        if want_startup != is_startup_enabled() and not set_startup(want_startup):
+        prev_startup = is_startup_enabled()
+        if want_startup != prev_startup and not set_startup(want_startup):
             # Windows refused the change; show what is actually registered.
             self.chk_startup.setChecked(is_startup_enabled())
             self._show_error(
@@ -749,6 +751,9 @@ class SettingsDialog(QDialog):
         if save_cfg(self.cfg) is False:
             self.cfg.clear()
             self.cfg.update(before)          # the live settings must not claim a save
+            if want_startup != prev_startup and not set_startup(prev_startup):
+                _log.error("Could not restore the Windows startup entry after a failed save.")
+            self.chk_startup.setChecked(is_startup_enabled())
             self._show_error(f"Could not save settings, see the log at {LOG_FILE}.")
             return
         self.accept()
